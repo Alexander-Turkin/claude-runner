@@ -1,0 +1,19 @@
+/Users/alexander/my projects/urfu-schedule-bot
+/private/tmp/claude-501/-Users-alexander-claude-runner/c2c81b91-2670-4611-85bc-d8ab6847fa4e/scratchpad/fx
+/private/tmp/claude-501/-Users-alexander-claude-runner/c2c81b91-2670-4611-85bc-d8ab6847fa4e/scratchpad/nogit
+/Users/alexander/repo/rest-fe
+/Users/alexander/my projects/cardholder
+/private/tmp/claude-501/-Users-alexander-my-projects-cardholder/48b67a2d-fd83-4f7e-bf07-ec7cdf39c147/scratchpad/demo2
+/private/tmp/claude-501/-Users-alexander-my-projects-cardholder/48b67a2d-fd83-4f7e-bf07-ec7cdf39c147/scratchpad/demo3
+/private/tmp/claude-501/-Users-alexander-my-projects-cardholder/48b67a2d-fd83-4f7e-bf07-ec7cdf39c147/scratchpad/demo
+/tmp/crun-inst
+/tmp/crun-net
+/tmp/crun-mem
+/tmp/crun-setup
+/tmp/crun-vf
+/tmp/crun-think
+/tmp/crun-live
+/tmp/crun-ctx
+/tmp/crun-fail
+/tmp/crun-sec
+/tmp/crun test proj

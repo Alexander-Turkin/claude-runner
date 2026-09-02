@@ -1,0 +1,44 @@
+{
+  "type": "object",
+  "properties": {
+    "understanding": {
+      "type": "string"
+    },
+    "ready": {
+      "type": "boolean"
+    },
+    "questions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "q": { "type": "string" },
+          "why": { "type": "string" },
+          "options": { "type": "array", "items": { "type": "string" } },
+          "default": { "type": "string" }
+        },
+        "required": ["q", "why"]
+      }
+    },
+    "tasks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "title": { "type": "string" },
+          "goal": { "type": "string" },
+          "acceptance": { "type": "array", "items": { "type": "string" } },
+          "context": { "type": "string" },
+          "not_in_scope": { "type": "string" },
+          "verify": { "type": ["string", "null"] },
+          "verify_timeout": { "type": ["integer", "null"] },
+          "depends_on": { "type": "array", "items": { "type": "integer" } },
+          "touches": { "type": "array", "items": { "type": "string" } },
+          "risk": { "type": "string", "enum": ["low", "medium", "high"] }
+        },
+        "required": ["title", "goal", "acceptance", "risk"]
+      }
+    }
+  },
+  "required": ["ready"]
+}

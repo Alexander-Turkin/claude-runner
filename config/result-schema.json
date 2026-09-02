@@ -1,0 +1,66 @@
+{
+  "type": "object",
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": [
+        "completed",
+        "blocked"
+      ]
+    },
+    "summary": {
+      "type": "string"
+    },
+    "files_changed": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "verification": {
+      "type": "string"
+    },
+    "blockers": {
+      "type": "string"
+    },
+    "needs_from_user": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "what": {
+            "type": "string"
+          },
+          "why": {
+            "type": "string"
+          },
+          "how": {
+            "type": "string"
+          },
+          "command": {
+            "type": "string",
+            "description": "Точная shell-команда, если требуемое ставится командой (brew install zbar, python3 -m pip install -e '.[dev]')"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "dependency",
+              "env",
+              "account",
+              "manual"
+            ],
+            "description": "dependency — установка пакета/библиотеки; env — переменная окружения или секрет; account — регистрация/доступ во внешнем сервисе; manual — прочее ручное действие"
+          }
+        },
+        "required": [
+          "what",
+          "how"
+        ]
+      }
+    }
+  },
+  "required": [
+    "status",
+    "summary"
+  ]
+}

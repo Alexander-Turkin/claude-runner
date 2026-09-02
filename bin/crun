@@ -1,0 +1,429 @@
+#!/bin/bash
+# crun — автономный раннер задач для Claude Code.
+# Запускать из обычного терминала, не изнутри сессии Claude Code.
+set -u
+
+# Скрипт вызывается через симлинк ~/.local/bin/crun — разворачиваем цепочку,
+# иначе CRUN_HOME указал бы на ~/.local вместо папки раннера.
+_self="${BASH_SOURCE[0]}"
+while [ -L "$_self" ]; do
+  _t=$(readlink "$_self")
+  case "$_t" in /*) _self="$_t" ;; *) _self="$(dirname "$_self")/$_t" ;; esac
+done
+CRUN_HOME="${CRUN_HOME:-$(cd "$(dirname "$_self")/.." && pwd)}"
+. "$CRUN_HOME/lib/common.sh"
+. "$CRUN_HOME/lib/pick.sh"
+. "$CRUN_HOME/lib/compile.sh"
+. "$CRUN_HOME/lib/report.sh"
+. "$CRUN_HOME/lib/run.sh"
+. "$CRUN_HOME/lib/plan.sh"
+. "$CRUN_HOME/lib/parallel.sh"
+
+CMD=""; PROJ=""; TASKS=""; BRIEF=""; BRIEFFILE=""
+DRY=0; YES=0; RECOMPILE=0; RETRY=0; LAST=0
+# Пусто = «флаг не задан», тогда берётся значение прошлого запуска.
+NOCOMMIT=""; KEEPGOING=""; ALLOWDIRTY=""
+ONLY=""; LIMIT=0; MODEL=""; PLANMODEL=""; QUIET=0; JOBS=""
+
+usage() {
+  cat <<'H'
+crun — автономный раннер задач для Claude Code
+
+  crun                        выбрать проект и папку задач, показать план, запустить
+  crun <проект> [папка]       то же, без выбора вручную
+  crun compile [проект] [папка]   только скомпилировать задачи и показать
+  crun status [проект]        что сделано, что осталось
+  crun setup [проект]         что нужно доустановить и настроить руками
+  crun new <название>         создать файл задачи из шаблона
+  crun plan <текст|файл.md>   разобрать задачу на задачи, задав вам вопросы
+  crun clarify [--only id]    ответить на открытые вопросы уже готовых задач
+
+Флаги:
+  --yes               не спрашивать подтверждение перед запуском
+  --last, -l          повторить прошлый запуск, ничего не спрашивая
+  --dry-run           показать план и выйти
+  --only <id>         выполнить одну задачу
+  --limit <N>         не больше N задач за прогон
+  --jobs <N>, -j <N>  сколько задач выполнять одновременно (по умолчанию 3)
+  --model <alias>     модель реализации задач (по умолчанию sonnet)
+  --plan-model <alias> модель компиляции задач (по умолчанию opus)
+  --quiet, -q         без построчного прогресса
+  --no-commit         не коммитить после задач
+  --continue-on-error идти дальше после провала
+  --retry-failed      вернуть проваленные задачи в очередь
+  --recompile         перекомпилировать задачи, игнорируя кэш
+  --allow-dirty       не требовать чистое рабочее дерево
+  --file <путь>       для crun plan: взять формулировку из файла
+H
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    compile|status|new|setup|plan|clarify) [ -z "$CMD" ] && CMD="$1" || true ;;
+    --yes|-y)           YES=1 ;;
+    --last|-l)          LAST=1 ;;
+    --dry-run)          DRY=1 ;;
+    --recompile)        RECOMPILE=1 ;;
+    --no-commit)        NOCOMMIT=1 ;;
+    --continue-on-error) KEEPGOING=1 ;;
+    --retry-failed)     RETRY=1 ;;
+    --allow-dirty)      ALLOWDIRTY=1 ;;
+    --only)             shift; ONLY="${1:-}" ;;
+    --file)             shift; BRIEFFILE="${1:-}" ;;
+    --limit)            shift; LIMIT="${1:-0}" ;;
+    --jobs|-j)          shift; JOBS="${1:-}" ;;
+    --model)            shift; MODEL="${1:-}" ;;
+    --plan-model)       shift; PLANMODEL="${1:-}" ;;
+    --quiet|-q)         QUIET=1 ;;
+    -h|--help)          usage; exit 0 ;;
+    --version)
+      b=$(crun_find_claude) || die "claude CLI не найден"
+      printf 'crun 1.0  ·  claude %s  ·  %s\n' "$("$b" --version 2>/dev/null)" "$b"; exit 0 ;;
+    -*)                 die "неизвестный флаг: $1" ;;
+    *)                  if [ "$CMD" = "new" ] && [ -z "$PROJ" ]; then PROJ="$1"
+                        elif [ "$CMD" = "plan" ] && [ -z "$BRIEF" ]; then BRIEF="$1"
+                        elif [ -z "$PROJ" ]; then PROJ="$1"
+                        elif [ -z "$TASKS" ]; then TASKS="$1"; fi ;;
+  esac
+  shift
+done
+
+BIN=$(crun_find_claude) || die "claude CLI не найден. Запустите: bash $CRUN_HOME/install.sh"
+command -v jq >/dev/null || die "нужен jq"
+
+# ---------- crun new ----------
+if [ "$CMD" = "new" ]; then
+  [ -n "$PROJ" ] || die "укажите название: crun new \"переделать вход\""
+  d="${CRUN_TASKS_DIR:-tasks}"; mkdir -p "$d"
+  n=$(printf '%03d' $(( $(ls "$d" 2>/dev/null | grep -c '^[0-9]') * 10 + 10 )))
+  f="$d/$n-$(crun_slug "$PROJ").md"
+  sed "s/{{TITLE}}/$PROJ/" "$CRUN_HOME/templates/task.md" > "$f"
+  ok "создано: $f"; exit 0
+fi
+
+# ---------- crun plan / crun clarify ----------
+# Работают в текущем каталоге: планировщику нужен код проекта, а спрашивать,
+# где он, когда вы уже стоите в нём, — лишний шаг.
+if [ "$CMD" = "plan" ] || [ "$CMD" = "clarify" ]; then
+  PROJ=$(pwd)
+  crun_recent_add "$PROJ"
+  crun_state_init "$PROJ"
+  [ -z "$PLANMODEL" ] && PLANMODEL=$(crun_last_get "$PROJ" planModel "")
+  [ -z "$PLANMODEL" ] && PLANMODEL=$(crun_cfg "$PROJ" planModel opus)
+
+  if [ "$CMD" = "clarify" ]; then
+    crun_clarify_run "$PROJ" "$ONLY"; exit $?
+  fi
+
+  # Формулировка: путь к файлу (явный --file или просто существующий путь) либо текст.
+  if [ -n "$BRIEFFILE" ]; then
+    [ -f "$BRIEFFILE" ] || die "файл не найден: $BRIEFFILE"
+    BRIEF=$(cat "$BRIEFFILE")
+  elif [ -n "$BRIEF" ] && [ -f "$BRIEF" ]; then
+    info "формулировка из файла: $BRIEF"
+    BRIEF=$(cat "$BRIEF")
+  fi
+  [ -n "$BRIEF" ] || die 'что делать? crun plan "текст задачи" или crun plan путь/к/файлу.md'
+
+  if [ -z "$TASKS" ]; then
+    TASKS=$(crun_last_get "$PROJ" tasks "")
+    [ -n "$TASKS" ] && [ -d "$TASKS" ] || TASKS="$PROJ/${CRUN_TASKS_DIR:-tasks}"
+  fi
+  case "$TASKS" in /*) ;; *) TASKS="$PROJ/$TASKS" ;; esac
+
+  printf '\n%sРазбор задачи%s  %s(%s · планирование: %s · до %s раундов вопросов)%s\n' \
+    "$C_B" "$C_RESET" "$C_DIM" "${TASKS#$PROJ/}/" "$PLANMODEL" \
+    "$(crun_cfg "$PROJ" planRounds 3)" "$C_RESET"
+  crun_plan_run "$PROJ" "$TASKS" "$BRIEF" "$BIN" "$PLANMODEL"; exit $?
+fi
+
+# ---------- 0. как в прошлый раз ----------
+if [ -z "$PROJ" ] && [ "$CMD" != "new" ]; then
+  LASTPROJ=$(crun_last_project 2>/dev/null) || LASTPROJ=""
+  if [ -n "$LASTPROJ" ]; then
+    LASTSUM=$(crun_last_summary "$LASTPROJ" 2>/dev/null) || LASTSUM=""
+    if [ -n "$LASTSUM" ]; then
+      if [ "$LAST" = "1" ]; then
+        PROJ="$LASTPROJ"; YES=1
+      else
+        printf '\n%sПовторить прошлый запуск?%s  %s%s · %s%s\n' \
+          "$C_B" "$C_RESET" "$C_DIM" "$(basename "$LASTPROJ")" "$LASTSUM" "$C_RESET"
+        printf '%s[Enter — да, n — выбрать заново]%s ' "$C_DIM" "$C_RESET"
+        read -r _a
+        case "$_a" in n|N|н|Н) ;; *) PROJ="$LASTPROJ" ;; esac
+      fi
+    fi
+  fi
+fi
+
+# ---------- 1. проект ----------
+if [ -z "$PROJ" ]; then
+  printf '\n%sВыберите проект%s\n\n' "$C_B" "$C_RESET"
+  PROJ=$(crun_pick_project) || die "проект не выбран"
+fi
+PROJ=$(cd "$PROJ" 2>/dev/null && pwd) || die "нет такой папки"
+crun_recent_add "$PROJ"
+crun_state_init "$PROJ"
+
+if [ "$CMD" = "status" ]; then
+  f=$(crun_state_file "$PROJ")
+  printf '\n%s%s%s\n\n' "$C_B" "${PROJ/#$HOME/~}" "$C_RESET"
+  jq -r '.tasks | to_entries | sort_by(.value.id)[] |
+    "  " + (if .value.status=="done" then "✓" elif .value.status=="failed" then "✗"
+            elif .value.status=="blocked" then "!" else "·" end) +
+    "  " + .value.id + "   " + .value.status' "$f" 2>/dev/null
+  [ -f "$(crun_state_dir "$PROJ")/SETUP.md" ] && \
+    printf '\n%sЕсть незакрытые запросы:%s %s\n' "$C_YEL" "$C_RESET" \
+      "$(crun_state_dir "$PROJ")/SETUP.md"
+  exit 0
+fi
+
+# ---------- 2. папка задач ----------
+if [ "$CMD" = "setup" ]; then
+  f="$(crun_state_dir "$PROJ")/SETUP.md"
+  if [ -f "$f" ]; then cat "$f"; else ok "ничего доустанавливать не нужно"; fi
+  exit 0
+fi
+
+# Флаги, не заданные явно, берём из прошлого запуска этого проекта.
+[ -z "$NOCOMMIT" ]   && NOCOMMIT=$(crun_last_get   "$PROJ" noCommit 0)
+[ -z "$KEEPGOING" ]  && KEEPGOING=$(crun_last_get  "$PROJ" continueOnError 0)
+[ -z "$ALLOWDIRTY" ] && ALLOWDIRTY=$(crun_last_get "$PROJ" allowDirty 0)
+[ -z "$MODEL" ]      && MODEL=$(crun_last_get      "$PROJ" model "")
+[ -z "$PLANMODEL" ]  && PLANMODEL=$(crun_last_get  "$PROJ" planModel "")
+[ -z "$JOBS" ]       && JOBS=$(crun_last_get       "$PROJ" jobs "")
+
+if [ -z "$TASKS" ]; then
+  T_REMEMBERED=$(crun_last_get "$PROJ" tasks "")
+  [ -n "$T_REMEMBERED" ] && [ -d "$T_REMEMBERED" ] && TASKS="$T_REMEMBERED"
+fi
+
+if [ -z "$TASKS" ]; then
+  printf '\n%sГде лежат задачи?%s  %s(%s)%s\n\n' "$C_B" "$C_RESET" "$C_DIM" "${PROJ/#$HOME/~}" "$C_RESET"
+  TASKS=$(crun_pick_tasks_dir "$PROJ") || die "папка задач не выбрана"
+fi
+case "$TASKS" in /*) ;; *) TASKS="$PROJ/$TASKS" ;; esac
+TASKS=$(cd "$TASKS" 2>/dev/null && pwd) || die "нет такой папки задач"
+
+# Opus думает над постановкой, Sonnet пишет код: планирование выигрывает от
+# сильной модели, реализация — от скорости и цены.
+[ -z "$MODEL" ]     && MODEL=$(crun_cfg "$PROJ" model sonnet)
+[ -z "$PLANMODEL" ] && PLANMODEL=$(crun_cfg "$PROJ" planModel opus)
+export CRUN_QUIET="$QUIET"
+BUDGET=$(crun_cfg "$PROJ" budget 5)
+TIMEOUT=$(crun_cfg "$PROJ" timeout 1800)
+[ -z "$JOBS" ] && JOBS=$(crun_cfg "$PROJ" jobs 3)
+case "$JOBS" in ''|*[!0-9]*) JOBS=1 ;; esac
+[ "$JOBS" -lt 1 ] && JOBS=1
+
+# Запоминаем выбор сразу, а не в конце: прерванный прогон тоже должен
+# восстанавливаться «как в прошлый раз».
+crun_last_save "$PROJ" "$TASKS" "$MODEL" "${NOCOMMIT:-0}" "${KEEPGOING:-0}" \
+               "${ALLOWDIRTY:-0}" "$LIMIT" "$PLANMODEL" "$JOBS"
+
+# ---------- 3. компиляция ----------
+printf '\n%sКомпиляция задач%s %s(планирование: %s)%s\n' \
+  "$C_B" "$C_RESET" "$C_DIM" "$PLANMODEL" "$C_RESET"
+COMPLIST=$(mktemp -t crun-complist)
+crun_compile_dir "$PROJ" "$TASKS" "$BIN" "$PLANMODEL" "$RECOMPILE" "$ONLY" "$LIMIT" "$COMPLIST" \
+  "$JOBS" || die "в папке $TASKS нет задач к выполнению (*.md)"
+
+if [ "$RETRY" = "1" ]; then
+  f=$(crun_state_file "$PROJ"); tmp=$(mktemp -t crun-state)
+  jq '.tasks |= with_entries(if .value.status=="failed" or .value.status=="blocked"
+        then .value.status="pending" else . end)' "$f" > "$tmp" && mv "$tmp" "$f"
+  info "проваленные задачи возвращены в очередь"
+fi
+
+CDIR="$(crun_state_dir "$PROJ")/compiled"
+# Очередь — только то, что отобрала компиляция: старые спеки из compiled/
+# не должны всплывать в прогоне, ограниченном --limit или --only.
+QUEUEFILE=$(mktemp -t crun-queue)
+while IFS=$'\t' read -r sha id; do
+  [ -n "$sha" ] || continue
+  f="$CDIR/$sha.json"
+  [ -f "$f" ] || continue
+  printf '%s\t%s\t%s\n' "$(jq -r '.order // 0' "$f")" "$id" "$f"
+done < "$COMPLIST" | sort -n -k1,1 -k2,2 | cut -f3 > "$QUEUEFILE"
+
+# ---------- 4. предпросмотр ----------
+GITST="не git-репозиторий"
+[ -d "$PROJ/.git" ] && {
+  if [ -n "$(crun_dirty "$PROJ")" ]; then GITST="есть незакоммиченные изменения"
+  else GITST="чисто, ветка $(cd "$PROJ" && git rev-parse --abbrev-ref HEAD 2>/dev/null)"; fi
+}
+
+# Параллельный режим держится на git worktree: там, где изоляцию не построить,
+# честнее откатиться на один поток, чем делать вид, что задачи независимы.
+PARWHY=""
+if [ "$JOBS" -gt 1 ]; then
+  if [ -n "$ONLY" ]; then
+    PARWHY="выбрана одна задача"
+  elif [ "$NOCOMMIT" = "1" ]; then
+    PARWHY="--no-commit: вливать в основную ветку нечего"
+  elif [ "$ALLOWDIRTY" = "1" ] && [ -n "$(crun_dirty "$PROJ")" ]; then
+    PARWHY="грязное дерево: worktree режется от HEAD и ваших правок не увидит"
+  else
+    PARWHY=$(crun_wt_check "$PROJ" "$JOBS") || true
+  fi
+  [ -n "$PARWHY" ] && JOBS=1
+fi
+USEWT=0; [ "$JOBS" -gt 1 ] && USEWT=1
+[ "$USEWT" = "1" ] && crun_wt_exclude "$PROJ"
+
+printf '\n%s%s%s\n' "$C_B" "──────────────────────────────────────────────────────────" "$C_RESET"
+printf '%sПроект:%s  %s   %s(git: %s)%s\n' "$C_B" "$C_RESET" "${PROJ/#$HOME/~}" "$C_DIM" "$GITST" "$C_RESET"
+printf '%sЗадачи:%s  %s\n' "$C_B" "$C_RESET" "${TASKS#$PROJ/}/"
+NETON=true; NETDOM=""; NETSRCH=true
+if [ -f "$PROJ/.claude-runner.json" ]; then
+  NETON=$(jq -r 'if .network.enabled == false then "false" else "true" end' "$PROJ/.claude-runner.json" 2>/dev/null)
+  NETDOM=$(jq -r '(.network.domains // []) | join(", ")' "$PROJ/.claude-runner.json" 2>/dev/null)
+  NETSRCH=$(jq -r 'if .network.search == false then "false" else "true" end' "$PROJ/.claude-runner.json" 2>/dev/null)
+fi
+if [ "$NETON" = "true" ]; then
+  if [ -n "$NETDOM" ]; then NETST="чтение: $NETDOM"
+  else NETST="чтение без ограничений по доменам"; fi
+  [ "$NETSRCH" = "true" ] && NETST="$NETST + поиск"
+else
+  NETST="нет"
+fi
+if [ "$(crun_mcp_enabled "$PROJ")" = "true" ]; then
+  MCPSRV=$(crun_mcp_servers "$PROJ" | tr '\n' ' ')
+  [ -n "$MCPSRV" ] && MCPST="$MCPSRV" || MCPST="включён, но серверов не настроено"
+else
+  MCPST="выключен"
+fi
+if [ "$(crun_install_enabled "$PROJ")" = "true" ]; then
+  INSTST="можно, кроме глобальных и публикации"
+else
+  INSTST="нельзя"
+fi
+printf '%sДоступ:%s  allow-лист, локальные команды · секреты: закрыты хуком\n' "$C_B" "$C_RESET"
+printf '%sСеть:%s    %s · MCP: %s\n' "$C_B" "$C_RESET" "$NETST" "$MCPST"
+printf '%sПакеты:%s  %s\n' "$C_B" "$C_RESET" "$INSTST"
+printf '%sМодели:%s  планирование %s · реализация %s · бюджет $%s/задача\n' \
+  "$C_B" "$C_RESET" "$PLANMODEL" "$MODEL" "$BUDGET"
+printf '%sРежим:%s   коммит: %s · при ошибке: %s\n' \
+  "$C_B" "$C_RESET" \
+  "$([ "$NOCOMMIT" = "1" ] && echo нет || echo да)" \
+  "$([ "$KEEPGOING" = "1" ] && echo 'идти дальше' || echo стоп)"
+if [ "$JOBS" -gt 1 ]; then
+  printf '%sПоток:%s   до %s задач разом, каждая в своём git worktree\n\n' \
+    "$C_B" "$C_RESET" "$JOBS"
+else
+  printf '%sПоток:%s   по одной%s\n\n' "$C_B" "$C_RESET" \
+    "$([ -n "$PARWHY" ] && printf ' — %s' "$PARWHY")"
+fi
+
+# Инструменты проекта, которыми будут исполняться verify-команды: показываем
+# ненайденные до старта, чтобы дыра в проверках всплыла до оплаты прогона.
+BINPATH=$(crun_project_bin_path "$PROJ")
+
+N=0
+while IFS= read -r s; do
+  [ -n "$s" ] || continue
+  id=$(jq -r ._id "$s"); sha=$(jq -r ._sha "$s")
+  st=$(crun_state_get "$PROJ" "$sha")
+  [ -n "$ONLY" ] && [ "$id" != "$ONLY" ] && continue
+  case "$st" in
+    done)    printf '  %s✓%s %-28s %sвыполнена%s\n' "$C_GRN" "$C_RESET" "$id" "$C_DIM" "$C_RESET"; continue ;;
+    blocked) printf '  %s!%s %-28s %sждёт вашего участия%s\n' "$C_YEL" "$C_RESET" "$id" "$C_DIM" "$C_RESET" ;;
+  esac
+  N=$((N+1))
+  # verify бывает длинным на несколько строк — в списке показываем начало.
+  vshort=$(jq -r '.verify // "—"' "$s" | tr '\n' ' ' | cut -c1-42)
+  [ "$(jq -r '.verify // "" | length' "$s")" -gt 42 ] && vshort="${vshort}…"
+  printf '  %s%d.%s %-24s %sverify:%s %-43s %sриск: %s%s\n' \
+    "$C_B" "$N" "$C_RESET" "$id" "$C_DIM" "$C_RESET" "$vshort" \
+    "$C_DIM" "$(jq -r .risk "$s")" "$C_RESET"
+  dep=$(jq -r '.depends_on[]?' "$s" | tr '\n' ' ')
+  [ -n "$dep" ] && printf '      %s← зависит от: %s%s\n' "$C_DIM" "$dep" "$C_RESET"
+  vmiss=$(cd "$PROJ" && crun_verify_missing "$(jq -r '.verify // empty' "$s")" "$BINPATH")
+  [ -n "$vmiss" ] && printf '      %s⚠ команда не найдена: %s%s\n' "$C_YEL" "$vmiss" "$C_RESET"
+  vblock=$(crun_verify_blocking "$(jq -r '.verify // empty' "$s")") && \
+    printf '      %s↻ проверка живучестью (%s): держать %sс, потом уборка%s\n' \
+      "$C_DIM" "$vblock" "$(crun_verify_timeout "$PROJ" "$s" 1)" "$C_RESET"
+  jq -r '.open_questions[]? | "      ⚠ неясно: " + .' "$s"
+done < "$QUEUEFILE"
+
+[ "$N" = "0" ] && { printf '\n'; ok "нечего делать — все задачи выполнены"; exit 0; }
+
+# Что с чем пойдёт разом — видно до подтверждения, а не по факту.
+if [ "$JOBS" -gt 1 ] && [ "$N" -gt 1 ]; then
+  WAVES=$(while IFS= read -r s; do
+            [ -n "$s" ] || continue
+            [ "$(crun_state_get "$PROJ" "$(jq -r ._sha "$s")")" = "done" ] && continue
+            printf '%s\t%s\n' "$(jq -r ._id "$s")" \
+              "$(jq -r '(.depends_on // [])[]' "$s" | tr '\n' ' ')"
+          done < "$QUEUEFILE" | crun_waves_line)
+  [ -n "$WAVES" ] && printf '\n  %s%s%s\n' "$C_DIM" "$WAVES" "$C_RESET"
+fi
+
+if [ "$ALLOWDIRTY" != "1" ] && [ -d "$PROJ/.git" ] && [ -n "$(crun_dirty "$PROJ")" ]; then
+  printf '\n'; err "рабочее дерево грязное — закоммитьте или уберите изменения (или --allow-dirty)"
+  exit 1
+fi
+
+[ "$DRY" = "1" ] && { printf '\n'; info "--dry-run: ничего не запущено"; exit 0; }
+[ "$CMD" = "compile" ] && { printf '\n'; ok "скомпилировано, спеки: $CDIR"; exit 0; }
+
+if [ "$YES" != "1" ]; then
+  printf '\n%sЗапустить %d задач(и) без дальнейших подтверждений? [y/N]%s ' "$C_B" "$N" "$C_RESET"
+  read -r a
+  case "$a" in y|Y|д|Д) ;; *) info "отменено"; exit 0 ;; esac
+fi
+
+# ---------- 5. выполнение ----------
+SETTINGS=$(mktemp -t crun-settings)
+# Файл настроек один на все слоты: пути в нём относительные, поэтому в worktree
+# они означают ровно то же, что и в основном дереве.
+crun_build_settings "$PROJ" "$TASKS" "$SETTINGS"
+trap 'rm -f "$SETTINGS" "$QUEUEFILE" "$COMPLIST"' EXIT
+# Ctrl+C должен снимать всех запущенных claude, а не одного: воркеры сидят
+# каждый в своей группе процессов, по ней и снимаем.
+trap 'crun_q_killall
+      printf "\n"; warn "прервано — прогресс сохранён, перезапуск продолжит с этого места"
+      exit 130' INT TERM
+
+# Очередь для планировщика: выполненное отсеиваем здесь, чтобы дальше не мешалось.
+RUNQ=$(mktemp -t crun-runq)
+while IFS= read -r s; do
+  [ -n "$s" ] || continue
+  id=$(jq -r ._id "$s"); sha=$(jq -r ._sha "$s")
+  [ -n "$ONLY" ] && [ "$id" != "$ONLY" ] && continue
+  [ "$(crun_state_get "$PROJ" "$sha")" = "done" ] && continue
+  printf '%s\n' "$s"
+done < "$QUEUEFILE" > "$RUNQ"
+trap 'rm -f "$SETTINGS" "$QUEUEFILE" "$COMPLIST" "$RUNQ"' EXIT
+
+T_ALL=$(date +%s)
+printf '\n'
+crun_run_queue "$PROJ" "$RUNQ" "$BIN" "$MODEL" "$BUDGET" "$TIMEOUT" "$SETTINGS" \
+  "$([ "$NOCOMMIT" = "1" ] && echo 0 || echo 1)" \
+  "$JOBS" "$LIMIT" "${KEEPGOING:-0}" "$USEWT"
+
+RC=$CRUN_Q_RC
+NDONE=$CRUN_Q_DONE; NBLOCK=$CRUN_Q_BLOCK; NFAIL=$CRUN_Q_FAIL; NSKIP=$CRUN_Q_SKIP
+TOTCOST=$CRUN_Q_COST
+
+[ "$USEWT" = "1" ] && crun_wt_cleanup "$PROJ" "$JOBS"
+[ "${CRUN_Q_NOTRUN:-0}" != "0" ] && \
+  warn "не запущено задач: $CRUN_Q_NOTRUN — прогон остановлен на ошибке (см. --continue-on-error)"
+
+printf '\n'
+printf '%s──────────────────────────────────────────────────────────%s\n' "$C_DIM" "$C_RESET"
+printf 'Итог: %s✓ %d%s · %s! %d%s · %s✗ %d%s%s · %s · $%.2f\n' \
+  "$C_GRN" "$NDONE" "$C_RESET" "$C_YEL" "$NBLOCK" "$C_RESET" \
+  "$C_RED" "$NFAIL" "$C_RESET" \
+  "$([ "${NSKIP:-0}" != "0" ] && printf ' · ⊘ %d пропущено' "$NSKIP")" \
+  "$(crun_fmt_time $(( $(date +%s) - T_ALL )))" "$TOTCOST"
+if [ "$RC" = "0" ]; then
+  ok "прогон завершён"
+else
+  warn "прогон завершён, но не все задачи закрыты — см. crun status"
+  [ "$NFAIL" != "0" ] && say "  $(crun_state_dir "$PROJ")/logs/LAST_FAILURE.md"
+  [ -f "$(crun_state_dir "$PROJ")/SETUP.md" ] && {
+    say "  что сделать руками:  crun setup"
+    say "  $(crun_state_dir "$PROJ")/SETUP.md"; }
+fi
+exit $RC
