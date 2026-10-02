@@ -160,7 +160,8 @@ crun_compile_model() {
           --strict-mcp-config \
           --tools "Read,Grep,Glob" \
           --append-system-prompt "$(cat "$CRUN_HOME/prompts/compile.md")" \
-          --model "$model" --max-budget-usd "$budget" 2>/dev/null)
+          --model "$model" --effort "$(crun_cfg "$proj" planEffort xhigh)" \
+          --max-budget-usd "$budget" 2>/dev/null)
   rm -f "$settings"
 
   [ -z "$raw" ] && return 1

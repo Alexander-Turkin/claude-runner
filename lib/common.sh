@@ -630,6 +630,14 @@ crun_net_prompt() {
 # type/scope/subject даёт исполнитель в отчёте — он знает, что сделал; ticket —
 # номер внешнего трекера из спека. Внутренний id раннера сюда не попадает.
 # $1 файл спека $2 JSON отчёта исполнителя
+# Тело коммита: английское commit.body из отчёта, а без него — summary.
+crun_commit_body() {
+  local r="${1:-}"
+  printf '%s' "$r" | jq -e 'type == "object"' >/dev/null 2>&1 || r='{}'
+  printf '%s' "$r" | jq -r '
+    [.commit.body, .summary] | map(select(type == "string" and . != "")) | first // ""'
+}
+
 crun_commit_subject() {
   local r="${2:-}"
   # Отчёт может прийти битым или пустым — коммит из-за этого терять нельзя.

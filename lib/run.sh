@@ -155,7 +155,8 @@ crun_run_one() {
     ${CRUN_MCP_ARGS[@]+"${CRUN_MCP_ARGS[@]}"} \
     ${srcdir[@]+"${srcdir[@]}"} \
     --append-system-prompt "$(cat "$CRUN_HOME/prompts/system.md"; printf '\n'; crun_net_prompt "$proj")" \
-    --model "$model" --max-budget-usd "$budget"
+    --model "$model" --effort "$(crun_cfg "$proj" effort high)" \
+    --max-budget-usd "$budget"
   rc=$?
   cd "$prev"
   PATH="$prevpath"; export PATH
@@ -327,11 +328,12 @@ crun_run_one() {
   fi
 
   if [ "$docommit" = "1" ] && [ -d "$proj/.git" ]; then
-    local subject
+    local subject body
     subject=$(crun_commit_subject "$spec" "$result")
+    body=$(crun_commit_body "$result")
     if [ "$work" != "$proj" ]; then
       # Задача жила в своём worktree: коммитим в ветке слота и вливаем в основную.
-      crun_wt_merge "$proj" "$slot" "$work" "$subject" "$summary"
+      crun_wt_merge "$proj" "$slot" "$work" "$subject" "$body"
       mrc=$?
       if [ "$mrc" = "2" ]; then
         crun_state_set "$proj" "$sha" "$id" failed "$(jq -r ._source "$spec")"
@@ -356,7 +358,7 @@ crun_run_one() {
       # тому, что реально оказалось в индексе.
       if ( cd "$proj" && git add -A -- . ':(exclude).claude-runner'
            git diff --cached --quiet && exit 1
-           git commit -q -m "$subject" -m "$summary" \
+           git commit -q -m "$subject" -m "$body" \
          ) >> "$logs/$id.log" 2>&1; then
         info "  коммит: $subject"
       else

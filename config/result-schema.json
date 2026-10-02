@@ -60,7 +60,7 @@
     },
     "commit": {
       "type": "object",
-      "description": "Заголовок коммита по сделанному: type(scope): subject",
+      "description": "Коммит по сделанному, на английском: type(scope): subject и тело",
       "properties": {
         "type": {
           "type": "string",
@@ -82,7 +82,11 @@
         },
         "subject": {
           "type": "string",
-          "description": "Что сделано, коротко, без номеров задач"
+          "description": "What was done, in English, imperative mood, short, no task numbers"
+        },
+        "body": {
+          "type": "string",
+          "description": "Commit body in English: what changed and why, 1-5 lines"
         }
       },
       "required": [
