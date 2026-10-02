@@ -259,6 +259,8 @@ crun_plan_run() {
   local rounds qa ready qs n total prefix map file created=0 t i
   local res=""
 
+  # Созданные файлы — для отдельного коммита перед запуском (crun_plan_commit).
+  CRUN_PLAN_FILES=""
   crun_ui_init
   rounds=$(crun_cfg "$proj" planRounds 3)
   qa=$(mktemp -t crun-plan-qa); : > "$qa"
@@ -304,6 +306,8 @@ crun_plan_run() {
     t=$(printf '%s' "$res" | jq -c ".tasks[$n]")
     n=$((n+1))
     file=$(crun_write_task "$proj" "$tasks" "$t" "$n" "$prefix" "$qa" "$map")
+    CRUN_PLAN_FILES="$CRUN_PLAN_FILES$file
+"
     created=$((created+1))
     printf '  %s✓%s %-40s %s%s%s\n' "$C_GRN" "$C_RESET" "$(basename "$file")" \
       "$C_DIM" "$(printf '%s' "$t" | jq -r '.verify // "без проверки"')" "$C_RESET"
@@ -328,9 +332,50 @@ crun_plan_run() {
   printf '\n'
   ok "создано задач: $created · вопросов задано: $(jq -s 'length' "$qa" 2>/dev/null || echo 0)"
   say "  файлы:  ${tasks#$proj/}/"
-  say "  запуск: crun"
   rm -f "$qa" "$map"
   return 0
+}
+
+# Что дальше после разбора — тот же нумерованный выбор, что у проекта и папки задач.
+# Enter и всё, кроме «1», — «позже»: случайное нажатие не должно стоить прогона.
+# 0 — запускать.
+crun_pick_after_plan() {
+  local choice
+  printf '\n%sЧто дальше?%s\n\n' "$C_B" "$C_RESET" >&2
+  printf '  %s1)%s Запустить задачи\n' "$C_B" "$C_RESET" >&2
+  printf '  %s2)%s %sПозже — запуск командой crun%s\n' "$C_B" "$C_RESET" "$C_DIM" "$C_RESET" >&2
+  printf '\n%sДействие [1-2]:%s ' "$C_B" "$C_RESET" >&2
+  read -r choice || choice=""
+  [ "$choice" = "1" ]
+}
+
+# Файлы задач из разбора коммитим отдельно и только их: иначе прогон упрётся
+# в грязное дерево, а `git add -A` первой задачи утащил бы их в свой коммит.
+# Коммит по путям не трогает чужие staged-правки. $1 проект; файлы — CRUN_PLAN_FILES.
+crun_plan_commit() {
+  local proj="$1" f out
+  local files=()
+  [ -d "$proj/.git" ] || return 0
+
+  while IFS= read -r f; do
+    [ -n "$f" ] && [ -f "$f" ] || continue
+    # Папка задач в .gitignore — коммитить нечего, дерево и так чистое.
+    git -C "$proj" check-ignore -q -- "$f" 2>/dev/null && continue
+    files+=("$f")
+  done <<EOF
+${CRUN_PLAN_FILES:-}
+EOF
+  [ "${#files[@]}" -gt 0 ] || return 0
+
+  if out=$(git -C "$proj" add -- "${files[@]}" 2>&1 && \
+           git -C "$proj" commit -q \
+             -m "chore(tasks): add ${#files[@]} tasks from crun plan" -- "${files[@]}" 2>&1); then
+    info "файлы задач закоммичены"
+    return 0
+  fi
+  err "не удалось закоммитить файлы задач:"
+  printf '%s\n' "$out" >&2
+  return 1
 }
 
 # crun clarify — пройтись по открытым вопросам уже скомпилированных задач.
