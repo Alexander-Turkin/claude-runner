@@ -34,7 +34,7 @@ crun — автономный раннер задач для Claude Code
   crun compile [проект] [папка]   только скомпилировать задачи и показать
   crun status [проект]        что сделано, что осталось
   crun setup [проект]         что нужно доустановить и настроить руками
-  crun new <название>         создать файл задачи из шаблона
+  crun new <название>         создать папку задачи с текстом из шаблона
   crun plan <текст|файл.md>   разобрать задачу на задачи, задав вам вопросы
   crun clarify [--only id]    ответить на открытые вопросы уже готовых задач
 
@@ -99,9 +99,11 @@ if [ "$CMD" = "new" ]; then
   [ -n "$PROJ" ] || die "укажите название: crun new \"переделать вход\""
   d="${CRUN_TASKS_DIR:-tasks}"; mkdir -p "$d"
   n=$(printf '%03d' $(( $(ls "$d" 2>/dev/null | grep -c '^[0-9]') * 10 + 10 )))
-  f="$d/$n-$(crun_slug "$PROJ").md"
-  sed "s/{{TITLE}}/$PROJ/" "$CRUN_HOME/templates/task.md" > "$f"
-  ok "создано: $f"; exit 0
+  # Задача — папка: текст плюс всё, что к ней относится (макеты, скриншоты, примеры).
+  f="$d/$n-$(crun_slug "$PROJ")"
+  mkdir -p "$f"
+  sed "s/{{TITLE}}/$PROJ/" "$CRUN_HOME/templates/task.md" > "$f/задача.md"
+  ok "создано: $f/задача.md — картинки и прочие материалы кладите в $f/"; exit 0
 fi
 
 # ---------- crun plan / crun clarify ----------
@@ -348,6 +350,8 @@ while IFS= read -r s; do
   vblock=$(crun_verify_blocking "$(jq -r '.verify // empty' "$s")") && \
     printf '      %s↻ проверка живучестью (%s): держать %sс, потом уборка%s\n' \
       "$C_DIM" "$vblock" "$(crun_verify_timeout "$PROJ" "$s" 1)" "$C_RESET"
+  natt=$(jq -r '.attachments // [] | length' "$s")
+  [ "$natt" != "0" ] && printf '      %s📎 материалов: %s%s\n' "$C_DIM" "$natt" "$C_RESET"
   jq -r '.open_questions[]? | "      ⚠ неясно: " + .' "$s"
 done < "$QUEUEFILE"
 

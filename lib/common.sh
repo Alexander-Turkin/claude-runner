@@ -645,8 +645,19 @@ crun_commit_subject() {
       + (if $tk then " (" + $tk + ")" else "" end)' "$1"
 }
 
-# SHA содержимого файла — ключ кэша компиляции.
-crun_sha() { shasum -a 256 "$1" 2>/dev/null | cut -c1-12; }
+# SHA содержимого — ключ кэша компиляции. У задачи-папки хэшируется список
+# «путь + хэш» всех её файлов: добавленная или изменённая картинка тоже требует
+# перекомпиляции, как правка текста.
+crun_sha() {
+  if [ -d "$1" ]; then
+    (cd "$1" && find . -type f ! -path '*/.*' | LC_ALL=C sort \
+       | while IFS= read -r f; do
+           printf '%s %s\n' "$f" "$(shasum -a 256 "$f" | cut -c1-64)"
+         done) | shasum -a 256 | cut -c1-12
+    return
+  fi
+  shasum -a 256 "$1" 2>/dev/null | cut -c1-12
+}
 
 crun_slug() {
   printf '%s' "$1" | tr '[:upper:]' '[:lower:]' \

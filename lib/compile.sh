@@ -1,9 +1,52 @@
 # Перевод задач из свободной формы в спек раннера. Исходники только читаются.
 
-# Файлы задач в папке: *.md верхнего уровня, служебные пропускаем.
+# Задачи в папке: *.md верхнего уровня и подпапки первого уровня (задача-папка:
+# текст плюс картинки и прочие материалы). Служебное (_*, скрытое) пропускаем;
+# папка без единого .md/.txt задачей не считается — это просто каталог с файлами.
 crun_scan_tasks() {
-  find "$1" -maxdepth 1 -type f -name '*.md' 2>/dev/null \
-    | grep -v '/README\.md$' | grep -v '/_' | sort
+  local d
+  {
+    find "$1" -maxdepth 1 -type f -name '*.md' 2>/dev/null \
+      | grep -v '/README\.md$' | grep -v '/_'
+    find "$1" -mindepth 1 -maxdepth 1 -type d ! -name '.*' ! -name '_*' 2>/dev/null \
+      | while IFS= read -r d; do
+          [ -n "$(crun_task_texts "$d" | head -1)" ] && printf '%s\n' "$d"
+        done
+  } | sort
+}
+
+# Материалы задачи-папки. Скрытые файлы не берём: .DS_Store и прочий мусор.
+crun_task_all_files() {
+  find "$1" -type f ! -path '*/.*' 2>/dev/null | LC_ALL=C sort
+}
+
+# Текст задачи: для файла — он сам, для папки — все .md/.txt в ней.
+crun_task_texts() {
+  if [ -d "$1" ]; then
+    crun_task_all_files "$1" | grep -Ei '\.(md|txt)$'
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
+# Вложения задачи-папки (картинки, PDF, примеры данных) — абсолютными путями,
+# JSON-массивом. У задачи-файла вложений нет.
+crun_task_attachments() {
+  if [ -d "$1" ]; then
+    crun_task_all_files "$1" | grep -Eiv '\.(md|txt)$' \
+      | jq -R -s -c 'split("\n") | map(select(length > 0))'
+  else
+    printf '[]'
+  fi
+}
+
+# Файл, в котором ищем frontmatter: сама задача или первый по алфавиту .md папки.
+crun_task_main() {
+  if [ -d "$1" ]; then
+    crun_task_all_files "$1" | grep -Ei '\.md$' | head -1
+  else
+    printf '%s' "$1"
+  fi
 }
 
 # Код задачи из имени файла: T0.1 → "T0.1". Пусто, если такого префикса нет.
@@ -49,7 +92,8 @@ crun_fm_list() {
 
 # Быстрый путь: собрать спек из frontmatter без вызова модели.
 crun_compile_frontmatter() {
-  local src="$1" order="$2" title verify vtmo deps touches ticket
+  local src order="$2" title verify vtmo deps touches ticket
+  src=$(crun_task_main "$1")
   title=$(crun_fm_get "$src" title)
   ticket=$(crun_fm_get "$src" ticket)
   verify=$(crun_fm_get "$src" verify)
@@ -84,10 +128,31 @@ crun_compile_model() {
       hooks:{PreToolUse:[{matcher:"Bash|Read|Edit|Write|Grep|Glob",
                           hooks:[{type:"command",command:$hook}]}]}}' > "$settings"
 
-  body=$(printf 'Скомпилируй эту задачу в спек.\n\nФайл: %s\n\n---\n%s\n---\n' \
-           "$src" "$(cat "$src")")
+  local att natt budget=1 tmo=180 f
+  att=$(crun_task_attachments "$src")
+  natt=$(printf '%s' "$att" | jq 'length')
 
-  raw=$(cd "$proj" && crun_run_limited 180 "$bin" -p "$body" \
+  if [ -d "$src" ]; then
+    body=$(
+      printf 'Скомпилируй эту задачу в спек.\n\nЗадача собрана из папки: %s\n' "$src"
+      while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        printf '\n### %s\n\n---\n%s\n---\n' "${f#$src/}" "$(cat "$f")"
+      done < <(crun_task_texts "$src")
+      if [ "$natt" != "0" ]; then
+        printf '\n## Материалы задачи\n\nПрочитай каждый файл инструментом Read — это часть постановки:\n\n'
+        printf '%s' "$att" | jq -r '.[] | "- " + .'
+        printf '\nТо, что видно на макетах и скриншотах (элементы, тексты, состояния), перенеси\nв критерии приёмки.\n'
+      fi
+    )
+    # Картинки стоят токенов и времени: десяток макетов в рамки обычной задачи не влезает.
+    if [ "$natt" != "0" ]; then budget=2; tmo=360; fi
+  else
+    body=$(printf 'Скомпилируй эту задачу в спек.\n\nФайл: %s\n\n---\n%s\n---\n' \
+             "$src" "$(cat "$src")")
+  fi
+
+  raw=$(cd "$proj" && crun_run_limited "$tmo" "$bin" -p "$body" \
           --output-format json \
           --json-schema "$(cat "$CRUN_HOME/config/compiled-schema.json")" \
           --permission-mode dontAsk \
@@ -95,7 +160,7 @@ crun_compile_model() {
           --strict-mcp-config \
           --tools "Read,Grep,Glob" \
           --append-system-prompt "$(cat "$CRUN_HOME/prompts/compile.md")" \
-          --model "$model" --max-budget-usd 1 2>/dev/null)
+          --model "$model" --max-budget-usd "$budget" 2>/dev/null)
   rm -f "$settings"
 
   [ -z "$raw" ] && return 1
@@ -122,8 +187,11 @@ crun_compile_write() {
     id=$(printf '%03d-%s' "$order" "$(crun_slug "$(printf '%s' "$spec" | jq -r .title)")")
   fi
 
+  # Вложения — из файловой системы, а не из ответа модели: путь, который она
+  # могла бы выдумать, исполнителю ни к чему.
   printf '%s' "$spec" | jq --arg s "$src" --arg h "$sha" --arg i "$id" --argjson o "$order" \
-    '. + {_source:$s, _sha:$h, _id:$i, order:$o}' > "$out.part" || return 1
+      --argjson a "$(crun_task_attachments "$src")" \
+    '. + {_source:$s, _sha:$h, _id:$i, order:$o, attachments:$a}' > "$out.part" || return 1
   mv "$out.part" "$out" || return 1
 
   # Человекочитаемая копия — её и показываем в предпросмотре.
@@ -134,6 +202,9 @@ crun_compile_write() {
     printf '## Цель\n\n%s\n\n' "$(jq -r .goal "$out")"
     printf '## Критерии приёмки\n\n'; jq -r '.acceptance[]? | "- " + .' "$out"
     printf '\n## Проверка\n\n%s\n' "$(jq -r '.verify // "— не задана"' "$out")"
+    if [ "$(jq -r '.attachments | length' "$out")" != "0" ]; then
+      printf '\n## Материалы\n\n'; jq -r '.attachments[] | "- `" + . + "`"' "$out"
+    fi
     if [ "$(jq -r '.open_questions | length' "$out")" != "0" ]; then
       printf '\n## Открытые вопросы\n\n'; jq -r '.open_questions[] | "- " + .' "$out"
     fi
@@ -213,7 +284,7 @@ crun_compile_dir() {
     rm -f "$out" "$cdir/$sha.md"
 
     built=$((built+1))
-    if crun_has_frontmatter "$src"; then
+    if crun_has_frontmatter "$(crun_task_main "$src")"; then
       printf '  %-34s %sиз frontmatter%s\n' "$(basename "$src")" "$C_DIM" "$C_RESET"
       spec=$(crun_compile_frontmatter "$src" "$order")
       crun_compile_write "$proj" "$src" "$sha" "$order" "$code" "$spec" >/dev/null

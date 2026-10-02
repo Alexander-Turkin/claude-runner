@@ -32,12 +32,28 @@ crun_build_prompt() {
     prog=$(printf '## Что уже сделано в проекте\n\n%s\n' "$prog")
   fi
 
+  # Материалы задачи-папки: картинки Read показывает модели как изображения,
+  # поэтому достаточно назвать пути и попросить прочитать.
+  local att src srcb
+  att=$(jq -r '.attachments[]? | "- `" + . + "`"' "$spec")
+  if [ -n "$att" ]; then
+    att=$(printf '## Материалы задачи\n\nПрежде чем начать, прочитай каждый файл инструментом Read — макеты,\nскриншоты и схемы здесь такая же часть постановки, как текст:\n\n%s\n' "$att")
+  fi
+
+  src=$(jq -r ._source "$spec")
+  if [ -d "$src" ]; then
+    srcb=$(printf 'Задача собрана из папки `%s` — там исходные тексты и все материалы. Если\nформулировка выше кажется неполной, загляни туда. Папка только для чтения, менять её нельзя.' "$src")
+  else
+    srcb=$(printf 'Задача скомпилирована из файла `%s`. Если формулировка выше кажется неполной —\nпрочитай оригинал. Файл только для чтения, менять его нельзя.' "$src")
+  fi
+
   tpl="${tpl//\{\{TITLE\}\}/$(jq -r .title "$spec")}"
   tpl="${tpl//\{\{GOAL\}\}/$(jq -r .goal "$spec")}"
   tpl="${tpl//\{\{ACCEPTANCE\}\}/$acc}"
   tpl="${tpl//\{\{VERIFY_BLOCK\}\}/$verify}"
   tpl="${tpl//\{\{QUESTIONS_BLOCK\}\}/$q}"
-  tpl="${tpl//\{\{SOURCE\}\}/$(jq -r ._source "$spec")}"
+  tpl="${tpl//\{\{ATTACHMENTS_BLOCK\}\}/$att}"
+  tpl="${tpl//\{\{SOURCE_BLOCK\}\}/$srcb}"
   tpl="${tpl//\{\{PROGRESS_BLOCK\}\}/$prog}"
   printf '%s' "$tpl"
 }
@@ -125,6 +141,10 @@ crun_run_one() {
   # Раннер выполняет задачу в подоболочке-воркере, у которой своя группа процессов,
   # поэтому Ctrl+C достаёт до claude через неё, а не через CRUN_CHILD_PID.
   crun_mcp_args "$proj"
+  # В параллельном прогоне cwd — worktree, а папка задачи лежит в основном дереве,
+  # вне его: без --add-dir Read отклонит её материалы по пути.
+  local srcdir=()
+  [ -d "$(jq -r ._source "$spec")" ] && srcdir=(--add-dir "$(jq -r ._source "$spec")")
   prev="$PWD"; cd "$work" || return 1
   crun_run_streamed "$tmo" "$logs/$id.jsonl" "$logs/$id.log" \
     "$bin" -p "$prompt" \
@@ -133,6 +153,7 @@ crun_run_one() {
     --permission-mode dontAsk \
     --settings "$settings" \
     ${CRUN_MCP_ARGS[@]+"${CRUN_MCP_ARGS[@]}"} \
+    ${srcdir[@]+"${srcdir[@]}"} \
     --append-system-prompt "$(cat "$CRUN_HOME/prompts/system.md"; printf '\n'; crun_net_prompt "$proj")" \
     --model "$model" --max-budget-usd "$budget"
   rc=$?
