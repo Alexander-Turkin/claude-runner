@@ -34,7 +34,8 @@
           "verify_timeout": { "type": ["integer", "null"] },
           "depends_on": { "type": "array", "items": { "type": "integer" } },
           "touches": { "type": "array", "items": { "type": "string" } },
-          "risk": { "type": "string", "enum": ["low", "medium", "high"] }
+          "risk": { "type": "string", "enum": ["low", "medium", "high"] },
+          "ticket": { "type": ["string", "null"] }
         },
         "required": ["title", "goal", "acceptance", "risk"]
       }

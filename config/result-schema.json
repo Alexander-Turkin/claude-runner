@@ -57,6 +57,38 @@
           "how"
         ]
       }
+    },
+    "commit": {
+      "type": "object",
+      "description": "Заголовок коммита по сделанному: type(scope): subject",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "feat",
+            "fix",
+            "refactor",
+            "perf",
+            "docs",
+            "test",
+            "chore",
+            "build",
+            "ci"
+          ]
+        },
+        "scope": {
+          "type": "string",
+          "description": "Домен изменения, коротко латиницей: auth, bot, runner"
+        },
+        "subject": {
+          "type": "string",
+          "description": "Что сделано, коротко, без номеров задач"
+        }
+      },
+      "required": [
+        "type",
+        "subject"
+      ]
     }
   },
   "required": [

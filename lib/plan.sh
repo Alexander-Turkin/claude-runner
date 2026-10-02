@@ -202,11 +202,13 @@ crun_write_task() {
   {
     printf -- '---\n'
     printf 'title: %s\n' "$title"
-    local v vt
+    local v vt tk
     v=$(printf '%s' "$t" | jq -r '.verify // empty')
     vt=$(printf '%s' "$t" | jq -r '.verify_timeout // empty')
+    tk=$(printf '%s' "$t" | jq -r '.ticket // empty')
     [ -n "$v" ]  && printf 'verify: %s\n' "$v"
     [ -n "$vt" ] && printf 'verify_timeout: %s\n' "$vt"
+    [ -n "$tk" ] && printf 'ticket: %s\n' "$tk"
     printf -- '---\n\n'
 
     printf '# %s\n\n' "$title"
@@ -242,6 +244,7 @@ crun_write_task() {
     --argjson deps "$depsjson" --argjson touches "$touchjson" --slurpfile qa "$qa" \
     '{title, goal, acceptance: (.acceptance // []), risk: (.risk // "medium"),
       verify: (.verify // null), verify_timeout: (.verify_timeout // null),
+      ticket: (.ticket // null),
       depends_on: $deps, touches: $touches, open_questions: [],
       answers: ($qa | map({q, a})),
       _source: $s, _sha: $h, _id: $i, order: $o}' > "$spec"

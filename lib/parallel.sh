@@ -19,9 +19,9 @@ crun_wt_branch() { printf 'crun/w%s' "$1"; }
 # В умолчание намеренно не входят data/ и *.db: изменяемое состояние, общее для
 # параллельных задач, — это гонка. Проекту, которому оно нужно, добавьте каталог
 # в worktreeLink осознанно.
-crun_wt_link() {
-  local proj="$1" work="$2" names d
-  names=$(crun_cfg_list "$proj" worktreeLink)
+crun_wt_link_names() {
+  local names
+  names=$(crun_cfg_list "$1" worktreeLink)
   if [ -z "$names" ]; then
     names='.venv
 venv
@@ -29,14 +29,31 @@ env
 node_modules
 .env'
   fi
+  printf '%s\n' "$names"
+}
+
+crun_wt_link() {
+  local proj="$1" work="$2" names d
+  # Страховка: с work == proj ссылка легла бы сама на себя и снесла бы окружение
+  # проекта (ln -s "$proj/node_modules" "$proj/node_modules" = самоссылка).
+  [ "$work" = "$proj" ] && return 0
+  names=$(crun_wt_link_names "$proj")
   while IFS= read -r d; do
     [ -n "$d" ] || continue
     # Только внутри проекта: симлинк наружу увёл бы задачу за границы доступа.
     case "$d" in /*|*..*) continue ;; esac
     [ -e "$proj/$d" ] || continue
-    [ -e "$work/$d" ] && continue
+    # Реальный каталог в воркере (модель сама поставила зависимости) — её, и он
+    # никуда за пределы воркера не ведёт. Не трогаем.
+    { [ -d "$work/$d" ] && [ ! -L "$work/$d" ]; } && continue
     mkdir -p "$(dirname "$work/$d")" 2>/dev/null
-    ln -s "$proj/$d" "$work/$d" 2>/dev/null
+    # -f -n обязательны. Без них `ln -s` на УЖЕ существующий симлинк-на-каталог
+    # разыменовывает его и кладёт ссылку ВНУТРЬ общего каталога проекта:
+    # получается $proj/node_modules/node_modules -> $proj/node_modules, то есть
+    # петля симлинков в окружении, общем для всех слотов. После неё любая
+    # pnpm-команда падает с ELOOP ещё до реальной работы. С -fn ссылка заменяется
+    # на месте, а битые и петлевые остатки прошлых прогонов лечатся сами.
+    ln -sfn "$proj/$d" "$work/$d" 2>/dev/null
   done <<EOF
 $names
 EOF
@@ -95,8 +112,11 @@ crun_wt_prepare() {
   if [ -e "$wt/.git" ]; then
     git -C "$wt" checkout -q -B "$br" "$head" 2>/dev/null || return 1
     git -C "$wt" reset -q --hard "$head" 2>/dev/null || return 1
-    # Без -x: игнорируемые .venv/node_modules и симлинки на них должны выжить,
-    # иначе каждый слот заново остаётся без окружения проекта.
+    # Без -x: сами игнорируемые .venv/node_modules должны выжить, иначе каждый
+    # слот заново остаётся без окружения проекта. СИМЛИНКИ на них при этом всё
+    # равно сносятся: типичный шаблон в .gitignore — `node_modules/`, со слешем,
+    # то есть матчит только каталоги, а симлинк для git — обычный неотслеживаемый
+    # файл. Это не беда, их сразу восстанавливает crun_wt_link ниже.
     git -C "$wt" clean -qfd 2>/dev/null
   else
     rm -rf "$wt" 2>/dev/null
@@ -110,9 +130,9 @@ crun_wt_prepare() {
 
 # Закоммитить работу задачи в ветке слота и влить в основную ветку.
 # 0 — влито (или коммитить нечего), 1 — не удалось закоммитить, 2 — конфликт.
-# $1 проект $2 слот $3 worktree $4 id $5 заголовок $6 summary
+# $1 проект $2 слот $3 worktree $4 заголовок коммита $5 summary
 crun_wt_merge() {
-  local proj="$1" n="$2" work="$3" id="$4" title="$5" summary="$6"
+  local proj="$1" n="$2" work="$3" subject="$4" summary="$5"
   local br lk rc=0
   br=$(crun_wt_branch "$n")
 
@@ -120,7 +140,7 @@ crun_wt_merge() {
   # смотрим на индекс, а не на него.
   git -C "$work" add -A -- . ':(exclude).claude-runner' 2>/dev/null
   git -C "$work" diff --cached --quiet 2>/dev/null && return 0
-  git -C "$work" commit -q -m "task($id): $title" -m "$summary" 2>/dev/null || return 1
+  git -C "$work" commit -q -m "$subject" -m "$summary" 2>/dev/null || return 1
 
   # Мерж меняет основное рабочее дерево — строго по одному за раз.
   lk=$(crun_lock_dir "$proj" git); crun_lock "$lk" 600 || return 1
@@ -250,9 +270,33 @@ crun_waves_line() {
 crun_wt_exclude() {
   local proj="$1" f line
   f="$proj/.git/info/exclude"
-  line='.claude-runner/worktrees/'
   [ -d "$proj/.git" ] || return 0
   mkdir -p "$(dirname "$f")" 2>/dev/null
+
+  # Симлинки на окружение проекта (crun_wt_link) обязаны быть невидимы для
+  # `git add -A` в crun_wt_merge. Иначе: типичный шаблон в .gitignore —
+  # `node_modules/`, со слешем, то есть матчит ТОЛЬКО каталоги, а симлинк для git
+  # — обычный неотслеживаемый файл. Он уходит в коммит задачи, мерж вносит его в
+  # основное дерево, и там tracked-симлинк `node_modules -> /абс/путь/node_modules`
+  # ПОДМЕНЯЕТ настоящий каталог на ссылку сам на себя: окружение проекта мертво,
+  # любая pnpm-команда падает с ELOOP. Точно так же уехал бы и `.env` с секретами.
+  # info/exclude лежит в общем git-каталоге, поэтому действует и во всех worktree.
+  # Уже отслеживаемые файлы exclude не затрагивает — снять с учёта он не может.
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    case "$line" in /*|*..*) continue ;; esac
+    crun_wt_exclude_line "$f" "/$line"
+  done <<EOF
+$(crun_wt_link_names "$proj")
+EOF
+
+  crun_wt_exclude_line "$f" '.claude-runner/worktrees/'
+  return 0
+}
+
+# Дописать строку в info/exclude, если её там ещё нет.
+crun_wt_exclude_line() {
+  local f="$1" line="$2"
   [ -f "$f" ] && grep -qxF "$line" "$f" 2>/dev/null && return 0
   printf '%s\n' "$line" >> "$f" 2>/dev/null
   return 0

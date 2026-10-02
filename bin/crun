@@ -45,7 +45,7 @@ crun — автономный раннер задач для Claude Code
   --only <id>         выполнить одну задачу
   --limit <N>         не больше N задач за прогон
   --jobs <N>, -j <N>  сколько задач выполнять одновременно (по умолчанию 3)
-  --model <alias>     модель реализации задач (по умолчанию sonnet)
+  --model <alias>     модель реализации задач (по умолчанию opus)
   --plan-model <alias> модель компиляции задач (по умолчанию opus)
   --quiet, -q         без построчного прогресса
   --no-commit         не коммитить после задач
@@ -88,6 +88,9 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+# Явно заданные модели — только их запоминаем: дефолт не должен залипать в last.json.
+MODEL_FLAG="$MODEL"; PLANMODEL_FLAG="$PLANMODEL"
+
 BIN=$(crun_find_claude) || die "claude CLI не найден. Запустите: bash $CRUN_HOME/install.sh"
 command -v jq >/dev/null || die "нужен jq"
 
@@ -108,7 +111,7 @@ if [ "$CMD" = "plan" ] || [ "$CMD" = "clarify" ]; then
   PROJ=$(pwd)
   crun_recent_add "$PROJ"
   crun_state_init "$PROJ"
-  [ -z "$PLANMODEL" ] && PLANMODEL=$(crun_last_get "$PROJ" planModel "")
+  [ -z "$PLANMODEL" ] && PLANMODEL=$(crun_last_model "$PROJ" planModel)
   [ -z "$PLANMODEL" ] && PLANMODEL=$(crun_cfg "$PROJ" planModel opus)
 
   if [ "$CMD" = "clarify" ]; then
@@ -189,8 +192,10 @@ fi
 [ -z "$NOCOMMIT" ]   && NOCOMMIT=$(crun_last_get   "$PROJ" noCommit 0)
 [ -z "$KEEPGOING" ]  && KEEPGOING=$(crun_last_get  "$PROJ" continueOnError 0)
 [ -z "$ALLOWDIRTY" ] && ALLOWDIRTY=$(crun_last_get "$PROJ" allowDirty 0)
-[ -z "$MODEL" ]      && MODEL=$(crun_last_get      "$PROJ" model "")
-[ -z "$PLANMODEL" ]  && PLANMODEL=$(crun_last_get  "$PROJ" planModel "")
+[ -z "$MODEL_FLAG" ]     && MODEL_FLAG=$(crun_last_model     "$PROJ" model)
+[ -z "$PLANMODEL_FLAG" ] && PLANMODEL_FLAG=$(crun_last_model "$PROJ" planModel)
+[ -z "$MODEL" ]      && MODEL="$MODEL_FLAG"
+[ -z "$PLANMODEL" ]  && PLANMODEL="$PLANMODEL_FLAG"
 [ -z "$JOBS" ]       && JOBS=$(crun_last_get       "$PROJ" jobs "")
 
 if [ -z "$TASKS" ]; then
@@ -205,9 +210,9 @@ fi
 case "$TASKS" in /*) ;; *) TASKS="$PROJ/$TASKS" ;; esac
 TASKS=$(cd "$TASKS" 2>/dev/null && pwd) || die "нет такой папки задач"
 
-# Opus думает над постановкой, Sonnet пишет код: планирование выигрывает от
-# сильной модели, реализация — от скорости и цены.
-[ -z "$MODEL" ]     && MODEL=$(crun_cfg "$PROJ" model sonnet)
+# Opus и думает над постановкой, и пишет код. Дешёвый режим — --model sonnet
+# или "model": "sonnet" в .claude-runner.json.
+[ -z "$MODEL" ]     && MODEL=$(crun_cfg "$PROJ" model opus)
 [ -z "$PLANMODEL" ] && PLANMODEL=$(crun_cfg "$PROJ" planModel opus)
 export CRUN_QUIET="$QUIET"
 BUDGET=$(crun_cfg "$PROJ" budget 5)
@@ -218,8 +223,8 @@ case "$JOBS" in ''|*[!0-9]*) JOBS=1 ;; esac
 
 # Запоминаем выбор сразу, а не в конце: прерванный прогон тоже должен
 # восстанавливаться «как в прошлый раз».
-crun_last_save "$PROJ" "$TASKS" "$MODEL" "${NOCOMMIT:-0}" "${KEEPGOING:-0}" \
-               "${ALLOWDIRTY:-0}" "$LIMIT" "$PLANMODEL" "$JOBS"
+crun_last_save "$PROJ" "$TASKS" "$MODEL_FLAG" "${NOCOMMIT:-0}" "${KEEPGOING:-0}" \
+               "${ALLOWDIRTY:-0}" "$LIMIT" "$PLANMODEL_FLAG" "$JOBS"
 
 # ---------- 3. компиляция ----------
 printf '\n%sКомпиляция задач%s %s(планирование: %s)%s\n' \

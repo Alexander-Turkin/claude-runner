@@ -49,8 +49,9 @@ crun_fm_list() {
 
 # Быстрый путь: собрать спек из frontmatter без вызова модели.
 crun_compile_frontmatter() {
-  local src="$1" order="$2" title verify vtmo deps touches
+  local src="$1" order="$2" title verify vtmo deps touches ticket
   title=$(crun_fm_get "$src" title)
+  ticket=$(crun_fm_get "$src" ticket)
   verify=$(crun_fm_get "$src" verify)
   # Необязательный срок проверки: потолок ожидания для обычной команды,
   # длительность удержания — для проверки живучестью.
@@ -62,11 +63,12 @@ crun_compile_frontmatter() {
   touches=$(crun_fm_list "$src" touches)
   jq -n --arg t "$title" \
         --arg g "$(sed -n '/^---$/,/^---$/!p' "$src" | head -40 | tr '\n' ' ' | cut -c1-500)" \
-        --arg v "$verify" --arg vt "$vtmo" --argjson o "$order" \
+        --arg v "$verify" --arg vt "$vtmo" --arg tk "$ticket" --argjson o "$order" \
         --argjson d "$deps" --argjson tc "$touches" \
     '{title:$t, order:$o, goal:$g, acceptance:[], risk:"low",
       verify:(if $v == "" then null else $v end),
       verify_timeout:(if $vt == "" then null else ($vt | tonumber) end),
+      ticket:(if $tk == "" then null else $tk end),
       depends_on:$d, touches:$tc, open_questions:[]}'
 }
 

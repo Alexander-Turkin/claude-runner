@@ -470,6 +470,16 @@ crun_last_get() {
   [ -n "$v" ] && printf '%s' "$v" || printf '%s' "$3"
 }
 
+# Запомненная модель ($2 = model | planModel). Верим только записям с маркером
+# modelsExplicit: раньше сохранялся и дефолт, и старый "sonnet" залипал бы навсегда.
+crun_last_model() {
+  local f; f=$(crun_last_file "$1")
+  [ -f "$f" ] || return 0
+  [ "$(jq -r '.modelsExplicit // empty' "$f" 2>/dev/null)" = "1" ] || return 0
+  crun_last_get "$1" "$2" ""
+}
+
+# $3 и $8 — только явно заданные флагами модели, иначе пусто.
 # $1 проект $2 папка задач $3 модель $4 no-commit $5 continue-on-error
 # $6 allow-dirty $7 limit $8 plan-model $9 jobs
 crun_last_save() {
@@ -478,7 +488,7 @@ crun_last_save() {
   jq -n --arg t "$2" --arg m "$3" --arg nc "$4" --arg ce "$5" \
         --arg ad "$6" --arg lim "$7" --arg pm "$8" --arg j "${9:-}" \
         --arg at "$(date '+%Y-%m-%d %H:%M')" \
-    '{tasks:$t, model:$m, planModel:$pm, noCommit:$nc, continueOnError:$ce,
+    '{tasks:$t, model:$m, planModel:$pm, modelsExplicit:"1", noCommit:$nc, continueOnError:$ce,
       allowDirty:$ad, limit:$lim, jobs:$j, at:$at}' > "$f"
   jq -n --arg p "$1" --arg at "$(date '+%Y-%m-%d %H:%M')" \
     '{project:$p, at:$at}' > "$CRUN_LAST_GLOBAL"
@@ -489,7 +499,8 @@ crun_last_summary() {
   local proj="$1" t m nc ce ad j extra=""
   t=$(crun_last_get "$proj" tasks "")
   [ -n "$t" ] || return 1
-  m=$(crun_last_get "$proj" model sonnet)
+  m=$(crun_last_model "$proj" model)
+  [ -n "$m" ] || m=$(crun_cfg "$proj" model opus)
   nc=$(crun_last_get "$proj" noCommit 0)
   ce=$(crun_last_get "$proj" continueOnError 0)
   ad=$(crun_last_get "$proj" allowDirty 0)
@@ -613,6 +624,25 @@ crun_net_prompt() {
     printf 'документацией или данными по библиотекам — предпочитай его: он точнее, чем\n'
     printf 'скачивание страниц. Инструментов нет — значит серверы не настроены, это не сбой.\n'
   fi
+}
+
+# Заголовок коммита задачи: type(scope): subject (ticket).
+# type/scope/subject даёт исполнитель в отчёте — он знает, что сделал; ticket —
+# номер внешнего трекера из спека. Внутренний id раннера сюда не попадает.
+# $1 файл спека $2 JSON отчёта исполнителя
+crun_commit_subject() {
+  local r="${2:-}"
+  # Отчёт может прийти битым или пустым — коммит из-за этого терять нельзя.
+  printf '%s' "$r" | jq -e 'type == "object"' >/dev/null 2>&1 || r='{}'
+  jq -r --argjson r "$r" '
+    def nz: select(type == "string" and . != "");
+    . as $s | ($r.commit // {}) as $c
+    | ([$c.type | nz] | first // "feat") as $ty
+    | ([$c.scope | nz] | first) as $sc
+    | ([$c.subject | nz] | first // $s.title) as $su
+    | ([$s.ticket | nz] | first) as $tk
+    | $ty + (if $sc then "(" + $sc + ")" else "" end) + ": " + $su
+      + (if $tk then " (" + $tk + ")" else "" end)' "$1"
 }
 
 # SHA содержимого файла — ключ кэша компиляции.

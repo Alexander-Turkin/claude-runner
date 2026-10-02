@@ -107,6 +107,19 @@ crun_run_one() {
     if [ -n "$pypath" ]; then
       PYTHONPATH="$pypath${PYTHONPATH:+:$PYTHONPATH}"; export PYTHONPATH
     fi
+
+    # Та же болезнь у pnpm. Перед `pnpm run` он сверяет node_modules с лок-файлом, а
+    # node_modules в worktree — симлинк на основное дерево: в
+    # node_modules/.pnpm-workspace-state-v1.json записан АБСОЛЮТНЫЙ путь проекта, он не
+    # совпадает с worktree, и деп-статус объявляется «out of sync». Дальше умолчание
+    # verifyDepsBeforeRun=install молча дёргает `pnpm install`, тот хочет пересобрать
+    # modules-каталог с нуля, просит подтверждения — а stdin у verify /dev/null, и pnpm
+    # падает с ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY. Задача считается провалённой,
+    # хотя код в порядке.
+    # Ни CI=true, ни confirmModulesPurge=false тут не подходят, хотя pnpm советует
+    # именно их: они РАЗРЕШАЮТ purge, а он идёт readdir+rimraf сквозь симлинк и выносит
+    # node_modules основного дерева — сразу у всех слотов.
+    export pnpm_config_verify_deps_before_run=false
   fi
 
   # Раннер выполняет задачу в подоболочке-воркере, у которой своя группа процессов,
@@ -293,9 +306,11 @@ crun_run_one() {
   fi
 
   if [ "$docommit" = "1" ] && [ -d "$proj/.git" ]; then
+    local subject
+    subject=$(crun_commit_subject "$spec" "$result")
     if [ "$work" != "$proj" ]; then
       # Задача жила в своём worktree: коммитим в ветке слота и вливаем в основную.
-      crun_wt_merge "$proj" "$slot" "$work" "$id" "$(jq -r .title "$spec")" "$summary"
+      crun_wt_merge "$proj" "$slot" "$work" "$subject" "$summary"
       mrc=$?
       if [ "$mrc" = "2" ]; then
         crun_state_set "$proj" "$sha" "$id" failed "$(jq -r ._source "$spec")"
@@ -311,7 +326,7 @@ crun_run_one() {
         err "не удалось закоммитить работу задачи"
         return 1
       fi
-      info "  коммит: task($id)"
+      info "  коммит: $subject"
     elif [ -n "$(crun_dirty "$proj")" ]; then
       # Ошибку коммита пишем в лог задачи, а не в /dev/null: молча несделанный
       # коммит выглядит как успешная задача и обнаруживается через день.
@@ -320,9 +335,9 @@ crun_run_one() {
       # тому, что реально оказалось в индексе.
       if ( cd "$proj" && git add -A -- . ':(exclude).claude-runner'
            git diff --cached --quiet && exit 1
-           git commit -q -m "task($id): $(jq -r .title "$spec")" -m "$summary" \
+           git commit -q -m "$subject" -m "$summary" \
          ) >> "$logs/$id.log" 2>&1; then
-        info "  коммит: task($id)"
+        info "  коммит: $subject"
       else
         warn "  коммит не сделан — см. $logs/$id.log"
       fi

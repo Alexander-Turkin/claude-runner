@@ -50,6 +50,12 @@
         "integer",
         "null"
       ]
+    },
+    "ticket": {
+      "type": [
+        "string",
+        "null"
+      ]
     }
   },
   "required": [
