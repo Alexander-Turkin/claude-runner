@@ -76,27 +76,214 @@ crun_install_hint() {
   return 0
 }
 
+# Промпт попытки исправления — сообщение в ту же сессию, что выполняла задачу.
+# Собирается через printf, а не подстановкой в шаблон: вывод проверки — произвольный
+# текст, и `&`, `\` в нём ничего значить не должны. В шаблон идут только числа.
+# $1 команда verify $2 номер попытки $3 сколько всего. Читает CRUN_VFAIL_SHORT и CRUN_VOUT.
+crun_build_fix_prompt() {
+  local verify="$1" n="$2" max="$3" vtail tpl
+  # В параллельном прогоне лог задачи лежит вне worktree, и модель его не прочитает:
+  # вывод идёт прямо в промпт. Хвост — там у тестов и линтеров итог.
+  vtail=$(printf '%s\n' "$CRUN_VOUT" | tail -n 200 | tail -c 30000)
+  [ -n "$vtail" ] || vtail="(команда ничего не вывела)"
+  tpl=$(cat "$CRUN_HOME/prompts/fix.md")
+  tpl="${tpl//\{\{ATTEMPT\}\}/$n}"
+  tpl="${tpl//\{\{MAX\}\}/$max}"
+  printf '## Проверка раннера не прошла\n\nТы отчитался, что задача сделана, но раннер выполнил свою проверку, и она не прошла.\n\n**Команда:**\n\n```\n%s\n```\n\n**Итог:** %s\n\n**Вывод команды** (последние строки):\n\n```\n%s\n```\n\n%s\n' \
+    "$verify" "$CRUN_VFAIL_SHORT" "$vtail" "$tpl"
+}
+
+# Один вызов claude по задаче: первая попытка или, с $4, дозапуск той же сессии.
+# Локальные переменные crun_run_one (work, bin, model, …) видны здесь по правилам
+# динамической области видимости bash — отдельно их не передаём.
+# $1 промпт $2 файл потока $3 файл ошибок $4 session_id для --resume (необязательно)
+#
+# При --resume флаги передаются все заново: --settings, MCP, --add-dir и режим прав
+# из сессии не восстанавливаются, а записанный в неё системный промпт повторная
+# передача того же текста не меняет.
+crun_task_claude() {
+  local p="$1" out="$2" errf="$3" sid="${4:-}" rc prev prevpath prevvenv pvenv
+  local resume=()
+  [ -n "$sid" ] && resume=(--resume "$sid")
+
+  # Инструменты проекта в PATH — и модели, и проверке ниже. Иначе модель зовёт
+  # .venv/bin/python -m pytest, а раннер потом запускает голый pytest и ловит 127.
+  # Подоболочки здесь быть не может (см. ниже), поэтому PATH возвращаем руками.
+  prevpath="$PATH"; prevvenv="${VIRTUAL_ENV:-}"
+  if [ -n "$binpath" ]; then
+    PATH="$binpath$PATH"; export PATH
+    if pvenv=$(crun_project_venv "$work"); then VIRTUAL_ENV="$pvenv"; export VIRTUAL_ENV; fi
+  fi
+
+  # Раннер выполняет задачу в подоболочке-воркере, у которой своя группа процессов,
+  # поэтому Ctrl+C достаёт до claude через неё, а не через CRUN_CHILD_PID.
+  prev="$PWD"; cd "$work" || return 1
+  crun_run_streamed "$tmo" "$out" "$errf" \
+    "$bin" -p "$p" \
+    ${resume[@]+"${resume[@]}"} \
+    --output-format stream-json --verbose \
+    --json-schema "$(cat "$CRUN_HOME/config/result-schema.json")" \
+    --permission-mode dontAsk \
+    --settings "$settings" \
+    ${CRUN_MCP_ARGS[@]+"${CRUN_MCP_ARGS[@]}"} \
+    ${srcdir[@]+"${srcdir[@]}"} \
+    --append-system-prompt "$(cat "$CRUN_HOME/prompts/system.md"; printf '\n'; crun_net_prompt "$proj")" \
+    --model "$model" --effort "$(crun_cfg "$proj" effort high)" \
+    --max-budget-usd "$budget"
+  rc=$?
+  cd "$prev"
+  PATH="$prevpath"; export PATH
+  if [ -n "$prevvenv" ]; then VIRTUAL_ENV="$prevvenv"; export VIRTUAL_ENV; else unset VIRTUAL_ENV; fi
+  return $rc
+}
+
+# Итоговое событие потока несёт отчёт, стоимость, авторитетный список отказов и id
+# сессии для дозапуска. Пишет result вызывающего и CRUN_LAST_COST/TURNS/SID.
+# $1 файл потока $2 куда записать отказы. 1 — отчёта нет.
+crun_task_report() {
+  local ev denials nden cost turns
+  # Отчёт прошлой попытки не должен пережить пустой отчёт этой.
+  result=""
+  rm -f "$2"
+  ev=$(jq -c -R 'fromjson? // empty | select(.type=="result")' "$1" 2>/dev/null | tail -1)
+  [ -n "$ev" ] || return 1
+
+  # Стоимость и шаги в событии — за этот вызов, а не за сессию: дозапуск через
+  # --resume отдаёт только свои (замерено на claude 2.1.251, хотя документация
+  # обещает накопительный итог). Поэтому попытки складываем.
+  cost=$(printf '%s' "$ev" | jq -r '.total_cost_usd // 0')
+  turns=$(printf '%s' "$ev" | jq -r '.num_turns // 0')
+  CRUN_LAST_COST=$(printf '%s + %s\n' "$CRUN_LAST_COST" "$cost" | bc -l 2>/dev/null \
+                   || printf '%s' "$cost")
+  CRUN_LAST_TURNS=$(( CRUN_LAST_TURNS + turns ))
+  CRUN_LAST_SID=$(printf '%s' "$ev" | jq -r '.session_id // empty')
+
+  denials=$(printf '%s' "$ev" | jq -c '.permission_denials // []')
+  nden=$(printf '%s' "$denials" | jq 'length')
+  if [ "$nden" != "0" ]; then
+    printf '%s' "$denials" | jq -r '.[] | "  ⊘ " + (.tool_name // "?") +
+      (if .tool_input.command then "(" + (.tool_input.command | .[0:60]) + ")" else "" end)' \
+      > "$2"
+    [ "${CRUN_QUIET:-0}" != "1" ] && \
+      printf '%s  отказов по правам: %s%s\n' "$C_YEL" "$nden" "$C_RESET"
+  fi
+  result=$(crun_claude_output "$ev")
+  [ -n "$result" ]
+}
+
+# Verify — источник истины, а не самоотчёт модели.
+# 0 — прошла; 1 — провалена; 2 — проверять нечем (пункт в SETUP.md уже записан).
+# При провале: CRUN_VFAIL — причина целиком для LAST_FAILURE.md, CRUN_VFAIL_SHORT —
+# строка на экран и для попытки исправления, CRUN_VOUT — вывод команды.
+# Переменные crun_run_one видны здесь по динамической области видимости.
+crun_task_verify() {
+  local vblock vlive vmiss hint vtmo vfile vt0 vsecs vrc vout
+  CRUN_VFAIL=""; CRUN_VFAIL_SHORT=""; CRUN_VOUT=""
+  info "  проверка: $verify"
+
+  # Команда, которая не завершается сама (`docker compose up`, dev-сервер), — это
+  # проверка живучестью: успех означает «поднялось и держится», а не «вышло с 0».
+  if vblock=$(crun_verify_blocking "$verify"); then vlive=1; else vlive=0; fi
+
+  # Дальше выясняем, есть ли чем проверять. Запускать команду с отсутствующим
+  # бинарём нельзя: код 127 под отрицанием (`… && ! cmd …`) превращается в 0,
+  # и задача засчитывается, не будучи проверенной ни разу.
+  vmiss=$(cd "$work" && crun_verify_missing "$verify" "$binpath")
+  if [ -n "$vmiss" ]; then
+    hint=$(crun_install_hint "$proj")
+    crun_needs_write "$proj" "$id" "$(jq -n \
+      --arg cmds "$vmiss" --arg id "$id" --arg v "$verify" --arg cmd "$hint" '
+      [{kind: "dependency",
+        what: ("установить в окружение проекта: " + $cmds),
+        why:  ("раннер проверяет задачу " + $id + " командой `" + $v +
+               "`, но этих команд нет в PATH проекта — проверить результат нечем"),
+        command: $cmd,
+        how:   ("Если инструмент ставится иначе — поставьте его в окружение проекта " +
+                "(.venv, node_modules) или укажите каталог с ним в ключе toolPaths " +
+                "файла .claude-runner.json.")}]')" >/dev/null
+    printf '\n--- verify: %s (не запущена) ---\nнет команд в PATH: %s\n' \
+      "$verify" "$vmiss" >> "$logs/$id.log"
+    warn "проверка не запущена — нет команд: $vmiss"
+    return 2
+  fi
+
+  # Даже завершающаяся команда может зависнуть (сеть, ожидание ввода), поэтому
+  # verify всегда идёт под таймаутом — иначе висит весь прогон, а не одна задача.
+  vtmo=$(crun_verify_timeout "$proj" "$spec" "$vlive")
+  [ "$vlive" = "1" ] && info "  проверка живучестью ($vblock): держать ${vtmo}с"
+  vfile=$(mktemp -t crun-verify)
+  vt0=$(date +%s)
+  crun_eval_limited "$vtmo" "$work" "$binpath" "$verify" "$vfile"; vrc=$?
+  vsecs=$(( $(date +%s) - vt0 ))
+  vout=$(cat "$vfile"); rm -f "$vfile"
+  CRUN_VOUT="$vout"
+
+  # Уборка обязательна и при успехе, и при провале: контейнеры живут в демоне
+  # docker и снятие нашей группы процессов их не гасит.
+  [ "$vlive" = "1" ] && crun_verify_teardown "$work" "$verify" "$binpath" "$logs/$id.log"
+
+  if [ "$vlive" = "1" ]; then
+    if [ "$vrc" = "124" ]; then
+      # Дожила до срока — это и есть успех проверки живучестью.
+      printf '\n--- verify: %s (жива %sс — успех) ---\n%s\n' "$verify" "$vtmo" "$vout" \
+        >> "$logs/$id.log"
+      return 0
+    fi
+    # Команда, которая не должна завершаться, завершилась: сборка сломалась
+    # или сервис упал на старте. Код 0 здесь тоже провал — `docker compose up`
+    # возвращает 0 и когда контейнер умер сам.
+    printf '\n--- verify: %s (завершилась через %sс, код %s) ---\n%s\n' \
+      "$verify" "$vsecs" "$vrc" "$vout" >> "$logs/$id.log"
+    CRUN_VFAIL="проверка живучестью \`$verify\` не продержалась ${vtmo}с: команда завершилась через ${vsecs}с с кодом $vrc. Сервис не поднялся или упал на старте — смотрите вывод ниже."
+    CRUN_VFAIL_SHORT="сервис не продержался ${vtmo}с (вышел через ${vsecs}с, код $vrc)"
+    return 1
+  fi
+
+  if [ "$vrc" = "124" ]; then
+    printf '\n--- verify: %s (таймаут %sс) ---\n%s\n' "$verify" "$vtmo" "$vout" >> "$logs/$id.log"
+    CRUN_VFAIL="проверка \`$verify\` не уложилась в ${vtmo}с и была снята вместе с потомками. Либо команда не завершается сама, либо ей нужно больше времени — увеличьте verifyTimeout в .claude-runner.json (или verify_timeout в самой задаче)."
+    CRUN_VFAIL_SHORT="проверка снята по таймауту (${vtmo}с)"
+    return 1
+  fi
+
+  printf '\n--- verify: %s (exit %s) ---\n%s\n' "$verify" "$vrc" "$vout" >> "$logs/$id.log"
+  if [ "$vrc" != "0" ]; then
+    CRUN_VFAIL="модель отчиталась completed, но проверка \`$verify\` упала (код $vrc)"
+    CRUN_VFAIL_SHORT="проверка не прошла (код $vrc)"
+    return 1
+  fi
+  return 0
+}
+
 # Выполнить одну задачу. 0 = успех, 1 = провал, 2 = blocked.
 # $1 проект $2 рабочий каталог $3 спек $4 бинарь $5 модель $6 бюджет $7 таймаут
 # $8 settings $9 commit(1/0) $10 слот
-# Наружу отдаёт CRUN_LAST_COST / CRUN_LAST_TURNS / CRUN_LAST_SECS для сводки.
+# Наружу отдаёт CRUN_LAST_COST / CRUN_LAST_TURNS / CRUN_LAST_SECS / CRUN_LAST_FIXES
+# для сводки.
 #
 # proj и work расходятся в параллельном режиме: состояние, логи и спеки всегда
 # лежат у проекта (один state.json на прогон), а правит задача свой worktree.
 # При jobs=1 work совпадает с proj, и поведение остаётся прежним.
+#
+# Упала проверка раннера — модель получает её вывод в ту же сессию и fixAttempts
+# раз (по умолчанию один) пробует починить; потом проверка повторяется. Сбои самого
+# claude, blocked и нехватку команд не повторяем: чинить там модели нечего.
 crun_run_one() {
   local proj="$1" work="$2" spec="$3" bin="$4" model="$5" budget="$6" tmo="$7"
   local settings="$8" docommit="$9" slot="${10:-1}"
-  local id sha state logs prompt rc ev result status summary verify vout vrc needs
-  local binpath prevpath prevvenv pvenv vmiss hint vblock vtmo vfile vlive vt0 vsecs
-  local t0 prev denials nden pypath mrc
+  local id sha state logs prompt rc result status summary verify needs
+  local binpath t0 pypath mrc vr
+  local fixmax fix=0 out den why short vfail="" errtmp
 
   id=$(jq -r ._id "$spec"); sha=$(jq -r ._sha "$spec")
   state=$(crun_state_dir "$proj"); logs="$state/logs"
   mkdir -p "$logs"
 
   CRUN_LAST_COST=0; CRUN_LAST_TURNS=0; CRUN_LAST_SECS=0
+  CRUN_LAST_FIXES=0; CRUN_LAST_SID=""
   prompt=$(crun_build_prompt "$proj" "$spec")
+  verify=$(jq -r '.verify // empty' "$spec")
+  fixmax=$(crun_fix_attempts "$proj")
   export CRUN_GUARD_LOG="$logs/guard.log"
 
   # Снимок до запуска: иначе при --allow-dirty в «изменено» попадут чужие файлы,
@@ -105,15 +292,7 @@ crun_run_one() {
   before_dirty=$(crun_dirty "$work" | sort)
 
   t0=$(date +%s)
-  # Инструменты проекта в PATH — и модели, и проверке ниже. Иначе модель зовёт
-  # .venv/bin/python -m pytest, а раннер потом запускает голый pytest и ловит 127.
-  # Подоболочки здесь быть не может (см. ниже), поэтому PATH возвращаем руками.
   binpath=$(crun_project_bin_path "$work")
-  prevpath="$PATH"; prevvenv="${VIRTUAL_ENV:-}"
-  if [ -n "$binpath" ]; then
-    PATH="$binpath$PATH"; export PATH
-    if pvenv=$(crun_project_venv "$work"); then VIRTUAL_ENV="$pvenv"; export VIRTUAL_ENV; fi
-  fi
 
   # Editable-install зашивает в .venv абсолютный путь к исходникам ПРОЕКТА, а .venv
   # в worktree — симлинк на него. Без правки PYTHONPATH и модель, и verify работали
@@ -138,171 +317,84 @@ crun_run_one() {
     export pnpm_config_verify_deps_before_run=false
   fi
 
-  # Раннер выполняет задачу в подоболочке-воркере, у которой своя группа процессов,
-  # поэтому Ctrl+C достаёт до claude через неё, а не через CRUN_CHILD_PID.
   crun_mcp_args "$proj"
   # В параллельном прогоне cwd — worktree, а папка задачи лежит в основном дереве,
   # вне его: без --add-dir Read отклонит её материалы по пути.
   local srcdir=()
   [ -d "$(jq -r ._source "$spec")" ] && srcdir=(--add-dir "$(jq -r ._source "$spec")")
-  prev="$PWD"; cd "$work" || return 1
-  crun_run_streamed "$tmo" "$logs/$id.jsonl" "$logs/$id.log" \
-    "$bin" -p "$prompt" \
-    --output-format stream-json --verbose \
-    --json-schema "$(cat "$CRUN_HOME/config/result-schema.json")" \
-    --permission-mode dontAsk \
-    --settings "$settings" \
-    ${CRUN_MCP_ARGS[@]+"${CRUN_MCP_ARGS[@]}"} \
-    ${srcdir[@]+"${srcdir[@]}"} \
-    --append-system-prompt "$(cat "$CRUN_HOME/prompts/system.md"; printf '\n'; crun_net_prompt "$proj")" \
-    --model "$model" --effort "$(crun_cfg "$proj" effort high)" \
-    --max-budget-usd "$budget"
-  rc=$?
-  cd "$prev"
-  PATH="$prevpath"; export PATH
-  if [ -n "$prevvenv" ]; then VIRTUAL_ENV="$prevvenv"; export VIRTUAL_ENV; else unset VIRTUAL_ENV; fi
-  CRUN_LAST_SECS=$(( $(date +%s) - t0 ))
 
-  if [ "$rc" = "124" ]; then
-    crun_state_set "$proj" "$sha" "$id" failed "$(jq -r ._source "$spec")"
-    crun_failure_write "$proj" "$id" "таймаут ${tmo}s — процесс снят" "$logs/$id.log" "$work" >/dev/null
-    err "таймаут ${tmo}s"
-    return 1
-  fi
-  if [ "$rc" != "0" ]; then
-    crun_state_set "$proj" "$sha" "$id" failed "$(jq -r ._source "$spec")"
-    crun_failure_write "$proj" "$id" "claude завершился с кодом $rc" "$logs/$id.log" "$work" >/dev/null
-    err "claude вышел с кодом $rc"
-    return 1
-  fi
+  crun_task_claude "$prompt" "$logs/$id.jsonl" "$logs/$id.log"; rc=$?
+  out="$logs/$id.jsonl"; den="$logs/$id-denials.txt"
 
-  # Итоговое событие потока несёт отчёт, стоимость и авторитетный список отказов.
-  ev=$(jq -c -R 'fromjson? // empty | select(.type=="result")' "$logs/$id.jsonl" 2>/dev/null | tail -1)
-  if [ -n "$ev" ]; then
-    CRUN_LAST_COST=$(printf '%s' "$ev" | jq -r '.total_cost_usd // 0')
-    CRUN_LAST_TURNS=$(printf '%s' "$ev" | jq -r '.num_turns // 0')
-    denials=$(printf '%s' "$ev" | jq -c '.permission_denials // []')
-    nden=$(printf '%s' "$denials" | jq 'length')
-    if [ "$nden" != "0" ]; then
-      printf '%s' "$denials" | jq -r '.[] | "  ⊘ " + (.tool_name // "?") +
-        (if .tool_input.command then "(" + (.tool_input.command | .[0:60]) + ")" else "" end)' \
-        > "$logs/$id-denials.txt"
-      [ "${CRUN_QUIET:-0}" != "1" ] && \
-        printf '%s  отказов по правам: %s%s\n' "$C_YEL" "$nden" "$C_RESET"
+  while :; do
+    CRUN_LAST_SECS=$(( $(date +%s) - t0 ))
+
+    why=""; short=""
+    if [ "$rc" = "124" ]; then
+      why="таймаут ${tmo}s — процесс снят"; short="таймаут ${tmo}s"
+    elif [ "$rc" != "0" ]; then
+      why="claude завершился с кодом $rc"; short="claude вышел с кодом $rc"
+    elif ! crun_task_report "$out" "$den"; then
+      why="не удалось разобрать отчёт задачи"; short="отчёт не разобран"
     fi
-    result=$(printf '%s' "$ev" | jq -c '.structured_output // empty')
-    if [ -z "$result" ]; then
-      result=$(printf '%s' "$ev" | jq -r '.result // empty' | sed '/^```/d' | jq -c . 2>/dev/null)
-    fi
-  fi
-
-  if [ -z "${result:-}" ]; then
-    crun_state_set "$proj" "$sha" "$id" failed "$(jq -r ._source "$spec")"
-    crun_failure_write "$proj" "$id" "не удалось разобрать отчёт задачи" "$logs/$id.log" "$work" >/dev/null
-    err "отчёт не разобран"
-    return 1
-  fi
-
-  status=$(printf '%s' "$result" | jq -r '.status // "blocked"')
-  summary=$(printf '%s' "$result" | jq -r '.summary // ""')
-
-  if [ "$status" = "blocked" ]; then
-    needs=$(printf '%s' "$result" | jq -c '.needs_from_user // []')
-    crun_state_set "$proj" "$sha" "$id" blocked "$(jq -r ._source "$spec")"
-    if [ "$(printf '%s' "$needs" | jq 'length')" != "0" ]; then
-      crun_needs_write "$proj" "$id" "$needs" >/dev/null
-      warn "нужно ваше участие: $summary"
-      return 2
-    fi
-    crun_failure_write "$proj" "$id" "задача заблокирована: $(printf '%s' "$result" | jq -r '.blockers // .summary')" "$logs/$id.log" "$work" >/dev/null
-    warn "заблокировано: $summary"
-    return 1
-  fi
-
-  # Verify — источник истины, а не самоотчёт модели.
-  verify=$(jq -r '.verify // empty' "$spec")
-  if [ -n "$verify" ]; then
-    info "  проверка: $verify"
-
-    # Команда, которая не завершается сама (`docker compose up`, dev-сервер), — это
-    # проверка живучестью: успех означает «поднялось и держится», а не «вышло с 0».
-    if vblock=$(crun_verify_blocking "$verify"); then vlive=1; else vlive=0; fi
-
-    # Дальше выясняем, есть ли чем проверять. Запускать команду с отсутствующим
-    # бинарём нельзя: код 127 под отрицанием (`… && ! cmd …`) превращается в 0,
-    # и задача засчитывается, не будучи проверенной ни разу.
-    vmiss=$(cd "$work" && crun_verify_missing "$verify" "$binpath")
-    if [ -n "$vmiss" ]; then
-      hint=$(crun_install_hint "$proj")
-      crun_state_set "$proj" "$sha" "$id" blocked "$(jq -r ._source "$spec")"
-      crun_needs_write "$proj" "$id" "$(jq -n \
-        --arg cmds "$vmiss" --arg id "$id" --arg v "$verify" --arg cmd "$hint" '
-        [{kind: "dependency",
-          what: ("установить в окружение проекта: " + $cmds),
-          why:  ("раннер проверяет задачу " + $id + " командой `" + $v +
-                 "`, но этих команд нет в PATH проекта — проверить результат нечем"),
-          command: $cmd,
-          how:   ("Если инструмент ставится иначе — поставьте его в окружение проекта " +
-                  "(.venv, node_modules) или укажите каталог с ним в ключе toolPaths " +
-                  "файла .claude-runner.json.")}]')" >/dev/null
-      printf '\n--- verify: %s (не запущена) ---\nнет команд в PATH: %s\n' \
-        "$verify" "$vmiss" >> "$logs/$id.log"
-      warn "проверка не запущена — нет команд: $vmiss"
-      return 2
-    fi
-
-    # Даже завершающаяся команда может зависнуть (сеть, ожидание ввода), поэтому
-    # verify всегда идёт под таймаутом — иначе висит весь прогон, а не одна задача.
-    vtmo=$(crun_verify_timeout "$proj" "$spec" "$vlive")
-    [ "$vlive" = "1" ] && info "  проверка живучестью ($vblock): держать ${vtmo}с"
-    vfile=$(mktemp -t crun-verify)
-    vt0=$(date +%s)
-    crun_eval_limited "$vtmo" "$work" "$binpath" "$verify" "$vfile"; vrc=$?
-    vsecs=$(( $(date +%s) - vt0 ))
-    vout=$(cat "$vfile"); rm -f "$vfile"
-
-    # Уборка обязательна и при успехе, и при провале: контейнеры живут в демоне
-    # docker и снятие нашей группы процессов их не гасит.
-    [ "$vlive" = "1" ] && crun_verify_teardown "$work" "$verify" "$binpath" "$logs/$id.log"
-
-    if [ "$vlive" = "1" ]; then
-      if [ "$vrc" = "124" ]; then
-        # Дожила до срока — это и есть успех проверки живучестью.
-        printf '\n--- verify: %s (жива %sс — успех) ---\n%s\n' "$verify" "$vtmo" "$vout" \
-          >> "$logs/$id.log"
-        vrc=0
-      else
-        # Команда, которая не должна завершаться, завершилась: сборка сломалась
-        # или сервис упал на старте. Код 0 здесь тоже провал — `docker compose up`
-        # возвращает 0 и когда контейнер умер сам.
-        printf '\n--- verify: %s (завершилась через %sс, код %s) ---\n%s\n' \
-          "$verify" "$vsecs" "$vrc" "$vout" >> "$logs/$id.log"
-        crun_state_set "$proj" "$sha" "$id" failed "$(jq -r ._source "$spec")"
-        crun_failure_write "$proj" "$id" \
-          "проверка живучестью \`$verify\` не продержалась ${vtmo}с: команда завершилась через ${vsecs}с с кодом $vrc. Сервис не поднялся или упал на старте — смотрите вывод ниже." \
-          "$logs/$id.log" "$work" >/dev/null
-        err "сервис не продержался ${vtmo}с (вышел через ${vsecs}с, код $vrc)"
-        return 1
+    if [ -n "$why" ]; then
+      # На попытке исправления первопричина — упавшая проверка, а не сбой дозапуска.
+      if [ "$fix" -gt 0 ]; then
+        why="$vfail; попытка исправления $fix не удалась: $why"
+        short="попытка исправления: $short"
       fi
-    elif [ "$vrc" = "124" ]; then
-      printf '\n--- verify: %s (таймаут %sс) ---\n%s\n' "$verify" "$vtmo" "$vout" >> "$logs/$id.log"
       crun_state_set "$proj" "$sha" "$id" failed "$(jq -r ._source "$spec")"
-      crun_failure_write "$proj" "$id" \
-        "проверка \`$verify\` не уложилась в ${vtmo}с и была снята вместе с потомками. Либо команда не завершается сама, либо ей нужно больше времени — увеличьте verifyTimeout в .claude-runner.json (или verify_timeout в самой задаче)." \
-        "$logs/$id.log" "$work" >/dev/null
-      err "проверка снята по таймауту (${vtmo}с)"
-      return 1
-    else
-      printf '\n--- verify: %s (exit %s) ---\n%s\n' "$verify" "$vrc" "$vout" >> "$logs/$id.log"
-    fi
-    if [ "$vrc" != "0" ]; then
-      crun_state_set "$proj" "$sha" "$id" failed "$(jq -r ._source "$spec")"
-      crun_failure_write "$proj" "$id" \
-        "модель отчиталась completed, но проверка \`$verify\` упала (код $vrc)" "$logs/$id.log" "$work" >/dev/null
-      err "проверка не прошла (код $vrc)"
+      crun_failure_write "$proj" "$id" "$why" "$logs/$id.log" "$work" >/dev/null
+      err "$short"
       return 1
     fi
-  fi
+
+    status=$(printf '%s' "$result" | jq -r '.status // "blocked"')
+    summary=$(printf '%s' "$result" | jq -r '.summary // ""')
+
+    if [ "$status" = "blocked" ]; then
+      needs=$(printf '%s' "$result" | jq -c '.needs_from_user // []')
+      crun_state_set "$proj" "$sha" "$id" blocked "$(jq -r ._source "$spec")"
+      if [ "$(printf '%s' "$needs" | jq 'length')" != "0" ]; then
+        crun_needs_write "$proj" "$id" "$needs" >/dev/null
+        warn "нужно ваше участие: $summary"
+        return 2
+      fi
+      crun_failure_write "$proj" "$id" "задача заблокирована: $(printf '%s' "$result" | jq -r '.blockers // .summary')" "$logs/$id.log" "$work" >/dev/null
+      warn "заблокировано: $summary"
+      return 1
+    fi
+
+    [ -n "$verify" ] || break
+    crun_task_verify; vr=$?
+    [ "$vr" = "0" ] && break
+    if [ "$vr" = "2" ]; then
+      crun_state_set "$proj" "$sha" "$id" blocked "$(jq -r ._source "$spec")"
+      return 2
+    fi
+
+    vfail="$CRUN_VFAIL"
+    if [ "$fix" -ge "$fixmax" ] || [ -z "$CRUN_LAST_SID" ]; then
+      [ "$fix" = "1" ] && vfail="$vfail — и после попытки исправления"
+      [ "$fix" -gt 1 ] && vfail="$vfail — и после $fix попыток исправления"
+      crun_state_set "$proj" "$sha" "$id" failed "$(jq -r ._source "$spec")"
+      crun_failure_write "$proj" "$id" "$vfail" "$logs/$id.log" "$work" >/dev/null
+      err "$CRUN_VFAIL_SHORT"
+      return 1
+    fi
+
+    fix=$((fix+1)); CRUN_LAST_FIXES=$fix
+    warn "  $CRUN_VFAIL_SHORT — попытка исправления $fix/$fixmax"
+    out="$logs/$id-fix$fix.jsonl"; den="$logs/$id-fix$fix-denials.txt"
+    # crun_run_streamed обнуляет файл ошибок, а в $id.log уже лежит вывод проверки:
+    # stderr попытки собираем отдельно и дописываем, чтобы LAST_FAILURE.md показал
+    # всю историю задачи.
+    errtmp=$(mktemp -t crun-fix)
+    crun_task_claude "$(crun_build_fix_prompt "$verify" "$fix" "$fixmax")" \
+      "$out" "$errtmp" "$CRUN_LAST_SID"; rc=$?
+    { printf '\n--- попытка исправления %s ---\n' "$fix"; cat "$errtmp"; } >> "$logs/$id.log"
+    rm -f "$errtmp"
+  done
 
   # Обратная связь по задаче: чем модель подтвердила результат и что реально
   # изменилось на диске. Список берём из git, а не из самоотчёта модели.

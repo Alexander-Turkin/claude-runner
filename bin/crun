@@ -228,7 +228,7 @@ TASKS=$(cd "$TASKS" 2>/dev/null && pwd) || die "нет такой папки з�
 [ -z "$MODEL" ]     && MODEL=$(crun_cfg "$PROJ" model opus)
 [ -z "$PLANMODEL" ] && PLANMODEL=$(crun_cfg "$PROJ" planModel opus)
 export CRUN_QUIET="$QUIET"
-BUDGET=$(crun_cfg "$PROJ" budget 5)
+BUDGET=$(crun_cfg "$PROJ" budget 10)
 TIMEOUT=$(crun_cfg "$PROJ" timeout 1800)
 [ -z "$JOBS" ] && JOBS=$(crun_cfg "$PROJ" jobs 3)
 case "$JOBS" in ''|*[!0-9]*) JOBS=1 ;; esac
@@ -321,10 +321,18 @@ printf '%sСеть:%s    %s · MCP: %s\n' "$C_B" "$C_RESET" "$NETST" "$MCPST"
 printf '%sПакеты:%s  %s\n' "$C_B" "$C_RESET" "$INSTST"
 printf '%sМодели:%s  планирование %s · реализация %s · бюджет $%s/задача\n' \
   "$C_B" "$C_RESET" "$PLANMODEL" "$MODEL" "$BUDGET"
-printf '%sРежим:%s   коммит: %s · при ошибке: %s\n' \
+# Сколько раз модель может починить упавшую проверку — см. crun_run_one.
+FIXN=$(crun_fix_attempts "$PROJ")
+case "$FIXN" in
+  0) FIXST="нет" ;;
+  1) FIXST="1 попытка" ;;
+  *) FIXST="до $FIXN попыток" ;;
+esac
+printf '%sРежим:%s   коммит: %s · при ошибке: %s · исправление: %s\n' \
   "$C_B" "$C_RESET" \
   "$([ "$NOCOMMIT" = "1" ] && echo нет || echo да)" \
-  "$([ "$KEEPGOING" = "1" ] && echo 'идти дальше' || echo стоп)"
+  "$([ "$KEEPGOING" = "1" ] && echo 'идти дальше' || echo стоп)" \
+  "$FIXST"
 if [ "$JOBS" -gt 1 ]; then
   printf '%sПоток:%s   до %s задач разом, каждая в своём git worktree\n\n' \
     "$C_B" "$C_RESET" "$JOBS"

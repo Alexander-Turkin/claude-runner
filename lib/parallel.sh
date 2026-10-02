@@ -393,8 +393,8 @@ crun_q_worker() {
   crun_run_one "$Q_PROJ" "$work" "${T_SPEC[$i]}" "$Q_BIN" "$Q_MODEL" "$Q_BUDGET" \
                "$Q_TMO" "$Q_SETTINGS" "$Q_COMMIT" "$slot"
   r=$?
-  printf '%s\t%s\t%s\t%s\n' "$r" "${CRUN_LAST_COST:-0}" "${CRUN_LAST_TURNS:-0}" \
-    "${CRUN_LAST_SECS:-0}" > "$CRUN_RUNDIR/$i.res"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$r" "${CRUN_LAST_COST:-0}" "${CRUN_LAST_TURNS:-0}" \
+    "${CRUN_LAST_SECS:-0}" "${CRUN_LAST_FIXES:-0}" > "$CRUN_RUNDIR/$i.res"
   return 0
 }
 
@@ -437,7 +437,7 @@ crun_run_queue() {
   Q_PROJ="$1"; local queue="$2"; Q_BIN="$3"; Q_MODEL="$4"; Q_BUDGET="$5"
   Q_TMO="$6"; Q_SETTINGS="$7"; Q_COMMIT="$8"; Q_JOBS="$9"
   local limit="${10}" keepgoing="${11}" usewt="${12}"
-  local s spec i j st r cost turns secs started=0 stopping=0
+  local s spec i j st r cost turns secs fixes started=0 stopping=0
   local running_now=0
 
   T_ID=(); T_SHA=(); T_SPEC=(); T_DEPS=(); T_TOUCH=(); T_ST=(); T_EXCL=()
@@ -486,16 +486,17 @@ crun_run_queue() {
         wait "${W_PID[$s]}" 2>/dev/null
         i="${W_TASK[$s]}"
         [ "$Q_JOBS" != "1" ] && crun_q_drain "$s"
-        r=1; cost=0; turns=0; secs=0
+        r=1; cost=0; turns=0; secs=0; fixes=0
         if [ -s "$CRUN_RUNDIR/$i.res" ]; then
-          IFS=$'\t' read -r r cost turns secs < "$CRUN_RUNDIR/$i.res"
+          IFS=$'\t' read -r r cost turns secs fixes < "$CRUN_RUNDIR/$i.res"
         fi
         CRUN_Q_COST=$(printf '%s + %s\n' "$CRUN_Q_COST" "${cost:-0}" \
                       | bc -l 2>/dev/null || printf '%s' "$CRUN_Q_COST")
         case "$r" in
           0) T_ST[$i]=done; CRUN_Q_DONE=$((CRUN_Q_DONE+1))
-             printf '%s✓%s %s · %s · $%.2f · %s шагов\n' "$C_GRN" "$C_RESET" \
-               "${T_ID[$i]}" "$(crun_fmt_time "${secs:-0}")" "${cost:-0}" "${turns:-0}" ;;
+             printf '%s✓%s %s · %s · $%.2f · %s шагов%s\n' "$C_GRN" "$C_RESET" \
+               "${T_ID[$i]}" "$(crun_fmt_time "${secs:-0}")" "${cost:-0}" "${turns:-0}" \
+               "$([ "${fixes:-0}" != "0" ] && printf ' · с исправлением')" ;;
           2) T_ST[$i]=blocked; CRUN_Q_BLOCK=$((CRUN_Q_BLOCK+1))
              warn "${T_ID[$i]}: нужно ваше участие — задача отложена"
              CRUN_Q_RC=2; [ "$keepgoing" = "1" ] || stopping=1 ;;

@@ -101,7 +101,7 @@ crun_ask_round() {
 # $1 проект $2 бриф $3 файл Q&A $4 бинарь $5 модель $6 раунд $7 всего раундов
 crun_plan_call() {
   local proj="$1" brief="$2" qa="$3" bin="$4" model="$5" round="$6" rounds="$7"
-  local settings body raw out qatext budget
+  local settings body raw out qatext budget tmo rc logs
 
   settings=$(mktemp -t crun-plan-settings)
   jq -n --slurpfile deny "$CRUN_HOME/config/deny.json" \
@@ -127,8 +127,11 @@ crun_plan_call() {
   body=$(printf 'Разбери задачу владельца на задачи для раннера.\n\n## Формулировка\n\n%s\n\n%s\n%s' \
            "$brief" "$qatext" "$tail_note")
 
-  budget=$(crun_cfg "$proj" planBudget 3)
-  raw=$(cd "$proj" && crun_run_limited 600 "$bin" -p "$body" \
+  budget=$(crun_cfg "$proj" planBudget 10)
+  tmo=$(crun_cfg "$proj" planTimeout 900)
+  # Ответ и stderr храним: без них любой сбой выглядит одинаково — «не ответил».
+  logs="$(crun_state_dir "$proj")/logs"; mkdir -p "$logs"
+  raw=$(cd "$proj" && crun_run_limited "$tmo" "$bin" -p "$body" \
           --output-format json \
           --json-schema "$(cat "$CRUN_HOME/config/plan-schema.json")" \
           --permission-mode dontAsk \
@@ -137,15 +140,44 @@ crun_plan_call() {
           --tools "Read,Grep,Glob" \
           --append-system-prompt "$(cat "$CRUN_HOME/prompts/plan.md")" \
           --model "$model" --effort "$(crun_cfg "$proj" planEffort xhigh)" \
-          --max-budget-usd "$budget" 2>/dev/null)
+          --max-budget-usd "$budget" 2> "$logs/plan-r$round.err")
+  rc=$?
   rm -f "$settings"
+  printf '%s' "$raw" > "$logs/plan-r$round.json"
 
-  [ -z "$raw" ] && return 1
-  out=$(printf '%s' "$raw" | jq -r '.result // empty' 2>/dev/null)
-  [ -z "$out" ] && return 1
-  out=$(printf '%s' "$out" | sed '/^```/d')
-  printf '%s' "$out" | jq -e '.ready != null' >/dev/null 2>&1 || return 1
-  printf '%s' "$out"
+  if out=$(crun_claude_output "$raw") && \
+     printf '%s' "$out" | jq -e '.ready != null' >/dev/null 2>&1; then
+    printf '%s' "$out"
+    return 0
+  fi
+  err "планировщик не ответил: $(crun_plan_why "$rc" "$raw" "$logs/plan-r$round.err" "$tmo" "$budget")"
+  return 1
+}
+
+# Почему вызов планировщика не дал разбора — одной строкой.
+# $1 код возврата $2 сырой ответ $3 файл stderr $4 таймаут $5 бюджет
+crun_plan_why() {
+  local rc="$1" raw="$2" errf="$3" tmo="$4" budget="$5" sub msg
+  if [ "$rc" = "124" ]; then
+    printf 'не уложился в %s с — поднимите planTimeout в .claude-runner.json' "$tmo"; return
+  fi
+  if [ -z "$raw" ]; then
+    msg=$(tail -n 3 "$errf" 2>/dev/null | jq -R -s -r 'gsub("^\\s+|\\s+$"; "") | gsub("\\s+"; " ") | .[0:200]')
+    printf 'claude ничего не вернул (код %s)%s' "$rc" "${msg:+: $msg}"; return
+  fi
+  sub=$(printf '%s' "$raw" | jq -r '.subtype // empty' 2>/dev/null)
+  [ "$sub" = "success" ] && sub=""
+  case "$sub" in
+    error_max_budget_usd)
+      printf 'кончился бюджет раунда $%s — поднимите planBudget в .claude-runner.json' "$budget"; return ;;
+    error_max_structured_output_retries)
+      printf 'модель не смогла собрать ответ по схеме'; return ;;
+  esac
+  if [ "$(printf '%s' "$raw" | jq -r '.is_error // false' 2>/dev/null)" = "true" ]; then
+    msg=$(printf '%s' "$raw" | jq -r '(.result // "") | gsub("^\\s+|\\s+$"; "") | gsub("\\s+"; " ") | .[0:200]' 2>/dev/null)
+    printf 'ошибка claude%s' "${msg:+: $msg}${sub:+ ($sub)}"; return
+  fi
+  printf 'в ответе нет разбора по схеме%s' "${sub:+ ($sub)}"
 }
 
 # Префикс имён для новых задач: продолжаем ту схему, что уже в папке.
@@ -253,6 +285,19 @@ crun_write_task() {
   printf '%s' "$file"
 }
 
+# Сбой разбора: показать, где логи, и не потерять ответы человека — это самое
+# дорогое, что было в диалоге. $1 проект $2 файл Q&A $3 файл соответствия
+crun_plan_fail() {
+  local proj="$1" qa="$2" map="$3" state saved
+  state="$(crun_state_dir "$proj")"
+  say "  логи:   ${state#$proj/}/logs/plan-r*.json, plan-r*.err"
+  if [ -s "$qa" ]; then
+    saved="$state/plan-answers.jsonl"
+    cp "$qa" "$saved" && say "  ваши ответы сохранены: ${saved#$proj/}"
+  fi
+  rm -f "$qa" "$map"
+}
+
 # crun plan — декомпозиция с диалогом. $1 проект $2 папка задач $3 бриф $4 бинарь $5 модель
 crun_plan_run() {
   local proj="$1" tasks="$2" brief="$3" bin="$4" model="$5"
@@ -266,13 +311,15 @@ crun_plan_run() {
   qa=$(mktemp -t crun-plan-qa); : > "$qa"
   map=$(mktemp -t crun-plan-map); : > "$map"
   mkdir -p "$tasks"
+  # Логи прошлого разбора убираем: иначе его plan-r4 легко принять за свежий.
+  rm -f "$(crun_state_dir "$proj")"/logs/plan-r*.json "$(crun_state_dir "$proj")"/logs/plan-r*.err
 
   i=1
   while [ "$i" -le "$rounds" ]; do
     printf '\n%sРаунд %s/%s%s %sдумаю над задачей…%s\n' \
       "$C_B" "$i" "$rounds" "$C_RESET" "$C_DIM" "$C_RESET"
     res=$(crun_plan_call "$proj" "$brief" "$qa" "$bin" "$model" "$i" "$rounds") || {
-      rm -f "$qa" "$map"; err "планировщик не ответил"; return 1; }
+      crun_plan_fail "$proj" "$qa" "$map"; return 1; }
 
     local und; und=$(printf '%s' "$res" | jq -r '.understanding // empty')
     [ -n "$und" ] && printf '%s%s%s\n' "$C_DIM" "$und" "$C_RESET"
@@ -292,11 +339,11 @@ crun_plan_run() {
     # ответам. Иначе диалог с человеком пропал бы впустую — худший исход из всех.
     printf '\n%sсобираю разбор по вашим ответам…%s\n' "$C_DIM" "$C_RESET"
     res=$(crun_plan_call "$proj" "$brief" "$qa" "$bin" "$model" "$((rounds+1))" "$rounds") || {
-      rm -f "$qa" "$map"; err "планировщик не ответил"; return 1; }
+      crun_plan_fail "$proj" "$qa" "$map"; return 1; }
     total=$(printf '%s' "$res" | jq '.tasks | length' 2>/dev/null || echo 0)
   fi
   if [ -z "$total" ] || [ "$total" = "0" ] || [ "$total" = "null" ]; then
-    rm -f "$qa" "$map"; err "планировщик не вернул задач"; return 1
+    err "планировщик не вернул задач"; crun_plan_fail "$proj" "$qa" "$map"; return 1
   fi
 
   prefix=$(crun_task_prefix "$tasks")

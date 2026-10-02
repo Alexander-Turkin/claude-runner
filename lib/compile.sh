@@ -128,7 +128,8 @@ crun_compile_model() {
       hooks:{PreToolUse:[{matcher:"Bash|Read|Edit|Write|Grep|Glob",
                           hooks:[{type:"command",command:$hook}]}]}}' > "$settings"
 
-  local att natt budget=1 tmo=180 f
+  local att natt budget tmo=180 f
+  budget=$(crun_cfg "$proj" compileBudget 10)
   att=$(crun_task_attachments "$src")
   natt=$(printf '%s' "$att" | jq 'length')
 
@@ -145,8 +146,8 @@ crun_compile_model() {
         printf '\nТо, что видно на макетах и скриншотах (элементы, тексты, состояния), перенеси\nв критерии приёмки.\n'
       fi
     )
-    # Картинки стоят токенов и времени: десяток макетов в рамки обычной задачи не влезает.
-    if [ "$natt" != "0" ]; then budget=2; tmo=360; fi
+    # Картинки стоят времени: десяток макетов в таймаут обычной задачи не влезает.
+    [ "$natt" != "0" ] && tmo=360
   else
     body=$(printf 'Скомпилируй эту задачу в спек.\n\nФайл: %s\n\n---\n%s\n---\n' \
              "$src" "$(cat "$src")")
@@ -165,10 +166,7 @@ crun_compile_model() {
   rm -f "$settings"
 
   [ -z "$raw" ] && return 1
-  spec=$(printf '%s' "$raw" | jq -r '.result // empty' 2>/dev/null)
-  [ -z "$spec" ] && return 1
-  # На случай, если модель обернула JSON в ```-блок.
-  spec=$(printf '%s' "$spec" | sed '/^```/d')
+  spec=$(crun_claude_output "$raw") || return 1
   # order задаёт имя файла, а не модель: её догадка ломает порядок этапов.
   printf '%s' "$spec" | jq -e --argjson o "$order" '.order = $o' 2>/dev/null || return 1
 }

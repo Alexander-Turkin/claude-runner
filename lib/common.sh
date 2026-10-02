@@ -273,6 +273,14 @@ crun_verify_timeout() {
   else                       crun_cfg "$proj" verifyTimeout 300; fi
 }
 
+# Сколько раз модель может починить упавшую проверку раннера (ключ fixAttempts).
+# 0 — не давать. Мусор в конфиге — умолчание, а не тихое отключение.
+crun_fix_attempts() {
+  local n; n=$(crun_cfg "$1" fixAttempts 1)
+  case "$n" in ''|*[!0-9]*) n=1 ;; esac
+  printf '%s' "$n"
+}
+
 # Прибрать за проверкой живучестью. Группу процессов снимает crun_eval_limited,
 # но контейнеры живут в демоне docker, а не под нами: снятие `docker compose up`
 # их не гасит, и после прогона на машине остаётся работающий сервис.
@@ -376,6 +384,22 @@ crun_run_limited() {
     sleep 1; waited=$((waited+1))
   done
   wait "$pid"
+}
+
+# Отчёт модели из итогового объекта claude -p (--json-schema).
+# Проверенный по схеме ответ лежит в structured_output, а .result — последний
+# текст модели: там бывает пусто или «Готово», и JSON оттуда — только запасной путь.
+# $1 итоговый объект. stdout — компактный JSON; 1, если отчёта нет.
+crun_claude_output() {
+  local raw="$1" out
+  out=$(printf '%s' "$raw" | jq -c '.structured_output // empty' 2>/dev/null)
+  if [ -z "$out" ]; then
+    # На случай, если модель обернула JSON в ```-блок.
+    out=$(printf '%s' "$raw" | jq -r '.result // empty' 2>/dev/null \
+            | sed '/^```/d' | jq -c . 2>/dev/null)
+  fi
+  [ -n "$out" ] || return 1
+  printf '%s' "$out"
 }
 
 # Ширина для обрезки строк прогресса.
