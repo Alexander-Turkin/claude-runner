@@ -15,12 +15,13 @@ CRUN_HOME="${CRUN_HOME:-$(cd "$(dirname "$_self")/.." && pwd)}"
 . "$CRUN_HOME/lib/pick.sh"
 . "$CRUN_HOME/lib/compile.sh"
 . "$CRUN_HOME/lib/report.sh"
+. "$CRUN_HOME/lib/baseline.sh"
 . "$CRUN_HOME/lib/run.sh"
 . "$CRUN_HOME/lib/plan.sh"
 . "$CRUN_HOME/lib/parallel.sh"
 
 CMD=""; PROJ=""; TASKS=""; BRIEF=""; BRIEFFILE=""
-DRY=0; YES=0; RECOMPILE=0; RETRY=0; LAST=0
+DRY=0; YES=0; RECOMPILE=0; RETRY=0; LAST=0; FORCE=0
 # Пусто = «флаг не задан», тогда берётся значение прошлого запуска.
 NOCOMMIT=""; KEEPGOING=""; ALLOWDIRTY=""
 ONLY=""; LIMIT=0; MODEL=""; PLANMODEL=""; QUIET=0; JOBS=""
@@ -37,6 +38,7 @@ crun — автономный раннер задач для Claude Code
   crun new <название>         создать папку задачи с текстом из шаблона
   crun plan <текст|файл.md>   разобрать задачу на задачи, задав вам вопросы, и предложить запуск
   crun clarify [--only id]    ответить на открытые вопросы уже готовых задач
+  crun baseline [проект] [папка]  прогнать verify задач на текущем коде, без модели
 
 Флаги:
   --yes               не спрашивать подтверждение перед запуском
@@ -55,12 +57,14 @@ crun — автономный раннер задач для Claude Code
   --recompile         перекомпилировать задачи, игнорируя кэш
   --allow-dirty       не требовать чистое рабочее дерево
   --file <путь>       для crun plan: взять формулировку из файла
+  --force             для crun baseline: прогнать заново, мимо кэша
+  --no-baseline       не проверять verify на базе (до запуска и перед задачами)
 H
 }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    compile|status|new|setup|plan|clarify) [ -z "$CMD" ] && CMD="$1" || true ;;
+    compile|status|new|setup|plan|clarify|baseline) [ -z "$CMD" ] && CMD="$1" || true ;;
     --yes|-y)           YES=1 ;;
     --last|-l)          LAST=1 ;;
     --dry-run)          DRY=1 ;;
@@ -69,6 +73,9 @@ while [ $# -gt 0 ]; do
     --continue-on-error) KEEPGOING=1 ;;
     --retry-failed)     RETRY=1 ;;
     --allow-dirty)      ALLOWDIRTY=1 ;;
+    --force)            FORCE=1 ;;
+    # Через окружение: его видят и воркеры в подоболочках.
+    --no-baseline)      export CRUN_NO_BASELINE=1 ;;
     --only)             shift; ONLY="${1:-}" ;;
     --file)             shift; BRIEFFILE="${1:-}" ;;
     --limit)            shift; LIMIT="${1:-0}" ;;
@@ -153,6 +160,9 @@ if [ "$CMD" = "plan" ] || [ "$CMD" = "clarify" ]; then
   CMD=""; YES=1
 fi
 
+# crun baseline без проекта — как plan: проект там, где вы стоите.
+[ "$CMD" = "baseline" ] && [ -z "$PROJ" ] && PROJ=$(pwd)
+
 # ---------- 0. как в прошлый раз ----------
 if [ -z "$PROJ" ] && [ "$CMD" != "new" ]; then
   LASTPROJ=$(crun_last_project 2>/dev/null) || LASTPROJ=""
@@ -182,6 +192,7 @@ crun_recent_add "$PROJ"
 crun_state_init "$PROJ"
 
 if [ "$CMD" = "status" ]; then
+  crun_needs_sweep "$PROJ"
   f=$(crun_state_file "$PROJ")
   printf '\n%s%s%s\n\n' "$C_B" "${PROJ/#$HOME/~}" "$C_RESET"
   jq -r '.tasks | to_entries | sort_by(.value.id)[] |
@@ -196,6 +207,8 @@ fi
 
 # ---------- 2. папка задач ----------
 if [ "$CMD" = "setup" ]; then
+  # Просьбы выполненных задач больше не актуальны.
+  crun_needs_sweep "$PROJ"
   f="$(crun_state_dir "$PROJ")/SETUP.md"
   if [ -f "$f" ]; then cat "$f"; else ok "ничего доустанавливать не нужно"; fi
   exit 0
@@ -263,6 +276,14 @@ while IFS=$'\t' read -r sha id; do
   [ -f "$f" ] || continue
   printf '%s\t%s\t%s\n' "$(jq -r '.order // 0' "$f")" "$id" "$f"
 done < "$COMPLIST" | sort -n -k1,1 -k2,2 | cut -f3 > "$QUEUEFILE"
+
+# ---------- crun baseline ----------
+if [ "$CMD" = "baseline" ]; then
+  trap 'crun_baseline_abort; printf "\n"; warn "прервано"; rm -f "$QUEUEFILE" "$COMPLIST"; exit 130' INT TERM
+  crun_baseline_table "$PROJ" "$QUEUEFILE" "$ONLY" "$FORCE"; _rc=$?
+  rm -f "$QUEUEFILE" "$COMPLIST"
+  exit $_rc
+fi
 
 # ---------- 4. предпросмотр ----------
 GITST="не git-репозиторий"
@@ -345,16 +366,50 @@ fi
 # ненайденные до старта, чтобы дыра в проверках всплыла до оплаты прогона.
 BINPATH=$(crun_project_bin_path "$PROJ")
 
+# Проверка verify на базе — до подтверждения и до оплаты: задача, чья проверка
+# красная ещё до работы, провалится при любом качестве работы. Такие задачи
+# откладываются (PREBLOCK), их зависимые — пропускаются. Гоняем только у готовых
+# задач: у зависимых база другая, её проверит crun_run_one перед стартом.
+IDMAP=$(mktemp -t crun-idmap); PREBLOCK=$(mktemp -t crun-preblock); : > "$PREBLOCK"
+trap 'rm -f "$QUEUEFILE" "$COMPLIST" "$IDMAP" "$PREBLOCK"' EXIT
+crun_q_build_idmap "$PROJ" "$IDMAP"
+if [ "$CMD" != "compile" ] && \
+   { [ "$ALLOWDIRTY" = "1" ] || [ ! -d "$PROJ/.git" ] || [ -z "$(crun_dirty "$PROJ")" ]; }; then
+  trap 'crun_baseline_abort; printf "\n"; warn "прервано"; exit 130' INT TERM
+  crun_baseline_prelaunch "$PROJ" "$QUEUEFILE" "$ONLY" "$IDMAP" "$PREBLOCK"
+  trap - INT TERM
+fi
+NPRE=0; RED_IDS=" "
+
 N=0
 while IFS= read -r s; do
   [ -n "$s" ] || continue
   id=$(jq -r ._id "$s"); sha=$(jq -r ._sha "$s")
   st=$(crun_state_get "$PROJ" "$sha")
   [ -n "$ONLY" ] && [ "$id" != "$ONLY" ] && continue
-  case "$st" in
-    done)    printf '  %s✓%s %-28s %sвыполнена%s\n' "$C_GRN" "$C_RESET" "$id" "$C_DIM" "$C_RESET"; continue ;;
-    blocked) printf '  %s!%s %-28s %sждёт вашего участия%s\n' "$C_YEL" "$C_RESET" "$id" "$C_DIM" "$C_RESET" ;;
-  esac
+  [ "$st" = "done" ] && {
+    printf '  %s✓%s %-28s %sвыполнена%s\n' "$C_GRN" "$C_RESET" "$id" "$C_DIM" "$C_RESET"; continue; }
+  if grep -qxF -- "$s" "$PREBLOCK"; then
+    crun_baseline_check "$PROJ" "$PROJ" "$s" "предзапуск" cached
+    _bl=$(crun_baseline_line)
+    printf '  %s✗%s %-28s не запустится — %s\n' "$C_RED" "$C_RESET" "$id" "${_bl/✗ /}"
+    printf '      %sverify: %s%s\n' "$C_DIM" "$(jq -r '.verify' "$s" | tr '\n' ' ' | cut -c1-90)" "$C_RESET"
+    crun_baseline_tail_lines 3
+    NPRE=$((NPRE+1)); RED_IDS="$RED_IDS$id "
+    continue
+  fi
+  _bad=""
+  for _d in $(jq -r '(.depends_on // [])[]' "$s"); do
+    case "$RED_IDS" in *" $_d "*) _bad="$_d"; break ;; esac
+  done
+  if [ -n "$_bad" ]; then
+    printf '  %s⊘%s %-28s %sпропустится: зависит от %s, а она отложена%s\n' \
+      "$C_YEL" "$C_RESET" "$id" "$C_DIM" "$_bad" "$C_RESET"
+    RED_IDS="$RED_IDS$id "
+    continue
+  fi
+  [ "$st" = "blocked" ] && \
+    printf '  %s!%s %-28s %sждёт вашего участия%s\n' "$C_YEL" "$C_RESET" "$id" "$C_DIM" "$C_RESET"
   N=$((N+1))
   # verify бывает длинным на несколько строк — в списке показываем начало.
   vshort=$(jq -r '.verify // "—"' "$s" | tr '\n' ' ' | cut -c1-42)
@@ -369,18 +424,55 @@ while IFS= read -r s; do
   vblock=$(crun_verify_blocking "$(jq -r '.verify // empty' "$s")") && \
     printf '      %s↻ проверка живучестью (%s): держать %sс, потом уборка%s\n' \
       "$C_DIM" "$vblock" "$(crun_verify_timeout "$PROJ" "$s" 1)" "$C_RESET"
+  _pend=$(crun_baseline_pending_deps "$s" "$IDMAP")
+  if [ -n "$(jq -r '.verify // empty' "$s")" ] && [ -z "$vblock" ]; then
+    if [ -n "$_pend" ]; then
+      printf '      %s⋯ база — после %s: проверю перед стартом задачи%s\n' "$C_DIM" "$_pend" "$C_RESET"
+    else
+      crun_baseline_check "$PROJ" "$PROJ" "$s" "предзапуск" cached
+      # Нехватку команд уже показала строка выше.
+      _bl=""; [ "$CRUN_BL_STATE" = "missing" ] || _bl=$(crun_baseline_line)
+      [ -n "$_bl" ] && printf '      %s\n' "$_bl"
+    fi
+  fi
   natt=$(jq -r '.attachments // [] | length' "$s")
   [ "$natt" != "0" ] && printf '      %s📎 материалов: %s%s\n' "$C_DIM" "$natt" "$C_RESET"
   jq -r '.open_questions[]? | "      ⚠ неясно: " + .' "$s"
 done < "$QUEUEFILE"
 
-[ "$N" = "0" ] && { printf '\n'; ok "нечего делать — все задачи выполнены"; exit 0; }
+# Отложить задачи с красной базой: state blocked и пункт в SETUP.md, в очередь
+# они не попадают, модель на них не тратится. Зависимые пропустит планировщик
+# очереди: он видит у зависимости blocked.
+crun_apply_preblock() {
+  local s id sha src
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    id=$(jq -r ._id "$s"); sha=$(jq -r ._sha "$s"); src=$(jq -r ._source "$s")
+    crun_baseline_check "$PROJ" "$PROJ" "$s" "предзапуск" cached
+    crun_state_set "$PROJ" "$sha" "$id" blocked "$src"
+    crun_needs_clear "$PROJ" "$id" "$sha" "$src"
+    crun_needs_write "$PROJ" "$id" "$(crun_baseline_needs "$id" "$(jq -r '.verify' "$s")" "$src")" \
+      "$sha" "$src" >/dev/null
+  done < "$PREBLOCK"
+}
+
+if [ "$N" = "0" ]; then
+  printf '\n'
+  if [ "$NPRE" -gt 0 ]; then
+    if [ "$DRY" != "1" ] && [ "$CMD" != "compile" ]; then crun_apply_preblock; fi
+    warn "запускать нечего: verify красная ещё до работы у задач: $NPRE — см. crun setup"
+    exit 2
+  fi
+  ok "нечего делать — все задачи выполнены"; exit 0
+fi
 
 # Что с чем пойдёт разом — видно до подтверждения, а не по факту.
 if [ "$JOBS" -gt 1 ] && [ "$N" -gt 1 ]; then
   WAVES=$(while IFS= read -r s; do
             [ -n "$s" ] || continue
             [ "$(crun_state_get "$PROJ" "$(jq -r ._sha "$s")")" = "done" ] && continue
+            # Не case: внутри $(…) bash 3.2 путает его ")" с концом подстановки.
+            printf '%s' "$RED_IDS" | grep -qF " $(jq -r ._id "$s") " && continue
             printf '%s\t%s\n' "$(jq -r ._id "$s")" \
               "$(jq -r '(.depends_on // [])[]' "$s" | tr '\n' ' ')"
           done < "$QUEUEFILE" | crun_waves_line)
@@ -396,7 +488,8 @@ fi
 [ "$CMD" = "compile" ] && { printf '\n'; ok "скомпилировано, спеки: $CDIR"; exit 0; }
 
 if [ "$YES" != "1" ]; then
-  printf '\n%sЗапустить %d задач(и) без дальнейших подтверждений? [y/N]%s ' "$C_B" "$N" "$C_RESET"
+  printf '\n%sЗапустить %d задач(и) без дальнейших подтверждений?%s%s [y/N]%s ' "$C_B" "$N" \
+    "$([ "$NPRE" -gt 0 ] && printf ' (%d отложено: проверка красная на базе)' "$NPRE")" "$C_B" "$C_RESET"
   read -r a
   case "$a" in y|Y|д|Д) ;; *) info "отменено"; exit 0 ;; esac
 fi
@@ -406,23 +499,28 @@ SETTINGS=$(mktemp -t crun-settings)
 # Файл настроек один на все слоты: пути в нём относительные, поэтому в worktree
 # они означают ровно то же, что и в основном дереве.
 crun_build_settings "$PROJ" "$TASKS" "$SETTINGS"
-trap 'rm -f "$SETTINGS" "$QUEUEFILE" "$COMPLIST"' EXIT
+trap 'rm -f "$SETTINGS" "$QUEUEFILE" "$COMPLIST" "$IDMAP" "$PREBLOCK"' EXIT
 # Ctrl+C должен снимать всех запущенных claude, а не одного: воркеры сидят
 # каждый в своей группе процессов, по ней и снимаем.
 trap 'crun_q_killall
       printf "\n"; warn "прервано — прогресс сохранён, перезапуск продолжит с этого места"
       exit 130' INT TERM
 
-# Очередь для планировщика: выполненное отсеиваем здесь, чтобы дальше не мешалось.
+# Отложенные из-за красной базы — до сборки очереди: их state нужен
+# планировщику, чтобы пропустить зависимые.
+[ "$NPRE" -gt 0 ] && crun_apply_preblock
+
+# Очередь для планировщика: выполненное и отложенное отсеиваем здесь.
 RUNQ=$(mktemp -t crun-runq)
 while IFS= read -r s; do
   [ -n "$s" ] || continue
   id=$(jq -r ._id "$s"); sha=$(jq -r ._sha "$s")
   [ -n "$ONLY" ] && [ "$id" != "$ONLY" ] && continue
   [ "$(crun_state_get "$PROJ" "$sha")" = "done" ] && continue
+  grep -qxF -- "$s" "$PREBLOCK" && continue
   printf '%s\n' "$s"
 done < "$QUEUEFILE" > "$RUNQ"
-trap 'rm -f "$SETTINGS" "$QUEUEFILE" "$COMPLIST" "$RUNQ"' EXIT
+trap 'rm -f "$SETTINGS" "$QUEUEFILE" "$COMPLIST" "$RUNQ" "$IDMAP" "$PREBLOCK"' EXIT
 
 T_ALL=$(date +%s)
 printf '\n'
@@ -431,7 +529,8 @@ crun_run_queue "$PROJ" "$RUNQ" "$BIN" "$MODEL" "$BUDGET" "$TIMEOUT" "$SETTINGS" 
   "$JOBS" "$LIMIT" "${KEEPGOING:-0}" "$USEWT"
 
 RC=$CRUN_Q_RC
-NDONE=$CRUN_Q_DONE; NBLOCK=$CRUN_Q_BLOCK; NFAIL=$CRUN_Q_FAIL; NSKIP=$CRUN_Q_SKIP
+NDONE=$CRUN_Q_DONE; NBLOCK=$((CRUN_Q_BLOCK + NPRE)); NFAIL=$CRUN_Q_FAIL; NSKIP=$CRUN_Q_SKIP
+[ "$RC" = "0" ] && [ "$NPRE" -gt 0 ] && RC=2
 TOTCOST=$CRUN_Q_COST
 
 [ "$USEWT" = "1" ] && crun_wt_cleanup "$PROJ" "$JOBS"

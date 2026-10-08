@@ -35,6 +35,7 @@
   "Bash(git remote rename*)",
   "Bash(git remote set-url*)",
   "Bash(git reset --hard*)",
+  "Bash(git stash*)",
   "Bash(launchctl *)",
   "Bash(nc *)",
   "Bash(npm i -g*)",

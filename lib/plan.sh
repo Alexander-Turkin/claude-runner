@@ -99,9 +99,13 @@ crun_ask_round() {
 
 # Один вызов планировщика. stdout = JSON ответа.
 # $1 проект $2 бриф $3 файл Q&A $4 бинарь $5 модель $6 раунд $7 всего раундов
+# $8 дополнительный текст (необязательно) $9 session_id для --resume (необязательно:
+# тогда сообщением идёт только $8 — планировщик продолжает свой же разбор)
 crun_plan_call() {
   local proj="$1" brief="$2" qa="$3" bin="$4" model="$5" round="$6" rounds="$7"
+  local extra="${8:-}" sid="${9:-}"
   local settings body raw out qatext budget tmo rc logs
+  local resume=()
 
   settings=$(mktemp -t crun-plan-settings)
   jq -n --slurpfile deny "$CRUN_HOME/config/deny.json" \
@@ -126,12 +130,18 @@ crun_plan_call() {
 
   body=$(printf 'Разбери задачу владельца на задачи для раннера.\n\n## Формулировка\n\n%s\n\n%s\n%s' \
            "$brief" "$qatext" "$tail_note")
+  if [ -n "$sid" ]; then
+    body="$extra"; resume=(--resume "$sid")
+  elif [ -n "$extra" ]; then
+    body=$(printf '%s\n\n%s' "$body" "$extra")
+  fi
 
   budget=$(crun_cfg "$proj" planBudget 10)
   tmo=$(crun_cfg "$proj" planTimeout 900)
   # Ответ и stderr храним: без них любой сбой выглядит одинаково — «не ответил».
   logs="$(crun_state_dir "$proj")/logs"; mkdir -p "$logs"
   raw=$(cd "$proj" && crun_run_limited "$tmo" "$bin" -p "$body" \
+          ${resume[@]+"${resume[@]}"} \
           --output-format json \
           --json-schema "$(cat "$CRUN_HOME/config/plan-schema.json")" \
           --permission-mode dontAsk \
@@ -235,18 +245,24 @@ crun_write_task() {
   {
     printf -- '---\n'
     printf 'title: %s\n' "$title"
-    local v vt tk
+    local v vt tk rk
     v=$(printf '%s' "$t" | jq -r '.verify // empty')
     vt=$(printf '%s' "$t" | jq -r '.verify_timeout // empty')
     tk=$(printf '%s' "$t" | jq -r '.ticket // empty')
+    rk=$(printf '%s' "$t" | jq -r '.risk // "medium"')
+    # id, риск, зависимости и область правки — во frontmatter, а не в теле: правка
+    # карточки руками меняет её хэш, и спек пересобирается по frontmatter. Без них
+    # там задача получила бы другой id, а зависимые — оборванные depends_on.
+    printf 'id: %s\n' "$id"
     [ -n "$v" ]  && printf 'verify: %s\n' "$v"
     [ -n "$vt" ] && printf 'verify_timeout: %s\n' "$vt"
     [ -n "$tk" ] && printf 'ticket: %s\n' "$tk"
+    printf 'risk: %s\n' "$rk"
+    [ -n "$deps" ] && printf 'depends_on: %s\n' "$(printf '%s' "$deps" | sed 's/ *$//; s/ /, /g')"
+    [ -n "$touches" ] && printf 'touches: %s\n' "$(printf '%s' "$touches" | sed 's/ *$//; s/ /, /g')"
     printf -- '---\n\n'
 
     printf '# %s\n\n' "$title"
-    [ -n "$deps" ] && printf '**Зависит от:** %s\n\n' "$deps"
-    [ -n "$touches" ] && printf '**Правит:** %s\n\n' "$touches"
 
     printf '## Цель\n\n%s\n\n' "$(printf '%s' "$t" | jq -r '.goal')"
 
@@ -302,7 +318,7 @@ crun_plan_fail() {
 crun_plan_run() {
   local proj="$1" tasks="$2" brief="$3" bin="$4" model="$5"
   local rounds qa ready qs n total prefix map file created=0 t i
-  local res=""
+  local res="" lastr=1 fb=""
 
   # Созданные файлы — для отдельного коммита перед запуском (crun_plan_commit).
   CRUN_PLAN_FILES=""
@@ -320,6 +336,7 @@ crun_plan_run() {
       "$C_B" "$i" "$rounds" "$C_RESET" "$C_DIM" "$C_RESET"
     res=$(crun_plan_call "$proj" "$brief" "$qa" "$bin" "$model" "$i" "$rounds") || {
       crun_plan_fail "$proj" "$qa" "$map"; return 1; }
+    lastr=$i
 
     local und; und=$(printf '%s' "$res" | jq -r '.understanding // empty')
     [ -n "$und" ] && printf '%s%s%s\n' "$C_DIM" "$und" "$C_RESET"
@@ -340,10 +357,35 @@ crun_plan_run() {
     printf '\n%sсобираю разбор по вашим ответам…%s\n' "$C_DIM" "$C_RESET"
     res=$(crun_plan_call "$proj" "$brief" "$qa" "$bin" "$model" "$((rounds+1))" "$rounds") || {
       crun_plan_fail "$proj" "$qa" "$map"; return 1; }
+    lastr=$((rounds+1))
     total=$(printf '%s' "$res" | jq '.tasks | length' 2>/dev/null || echo 0)
   fi
   if [ -z "$total" ] || [ "$total" = "0" ] || [ "$total" = "null" ]; then
     err "планировщик не вернул задач"; crun_plan_fail "$proj" "$qa" "$map"; return 1
+  fi
+
+  # Планировщик только читает и не знает, зелёные ли его verify. Раннер прогоняет
+  # их на текущем коде; красные возвращает ему одним корректирующим вызовом в ту
+  # же сессию. В Q&A это не идёт: там ответы человека, они попадут в карточки.
+  fb=$(mktemp -t crun-plan-fb)
+  if ! crun_plan_baseline "$proj" "$res" "$fb" "$tasks"; then
+    printf '\n%sпрошу планировщика заменить красные проверки…%s\n' "$C_DIM" "$C_RESET"
+    local sid res2 total2
+    sid=$(jq -r '.session_id // empty' "$(crun_state_dir "$proj")/logs/plan-r$lastr.json" 2>/dev/null)
+    if res2=$(crun_plan_call "$proj" "$brief" "$qa" "$bin" "$model" "$((rounds+2))" "$rounds" \
+                "$(cat "$fb")" "$sid"); then
+      total2=$(printf '%s' "$res2" | jq '.tasks | length' 2>/dev/null || echo 0)
+      if [ "$(printf '%s' "$res2" | jq -r '.ready')" = "true" ] && \
+         [ "${total2:-0}" -gt 0 ] 2>/dev/null; then
+        res="$res2"; total="$total2"
+        crun_plan_baseline "$proj" "$res" "$fb" "$tasks" || \
+          warn "часть проверок осталась красной — такие задачи не запустятся, пока их не поправить"
+      else
+        warn "планировщик не вернул исправленный разбор — оставляю прежний"
+      fi
+    else
+      warn "корректирующий вызов не удался — оставляю прежний разбор"
+    fi
   fi
 
   prefix=$(crun_task_prefix "$tasks")
@@ -358,6 +400,11 @@ crun_plan_run() {
     created=$((created+1))
     printf '  %s✓%s %-40s %s%s%s\n' "$C_GRN" "$C_RESET" "$(basename "$file")" \
       "$C_DIM" "$(printf '%s' "$t" | jq -r '.verify // "без проверки"')" "$C_RESET"
+    if [ -s "$fb.red" ] && \
+       grep -qxF -- "$(printf '%s' "$t" | jq -r '.verify // empty')" "$fb.red" 2>/dev/null; then
+      printf '      %s✗ verify красная на текущем коде — задача не запустится, пока её не поправить%s\n' \
+        "$C_RED" "$C_RESET"
+    fi
   done
 
   # Показываем, что из этого пойдёт параллельно: это главный результат разметки
@@ -379,8 +426,84 @@ crun_plan_run() {
   printf '\n'
   ok "создано задач: $created · вопросов задано: $(jq -s 'length' "$qa" 2>/dev/null || echo 0)"
   say "  файлы:  ${tasks#$proj/}/"
-  rm -f "$qa" "$map"
+  rm -f "$qa" "$map" "$fb" "$fb.red" "$fb.map"
   return 0
+}
+
+# Прогнать предложенные verify на текущем коде (crun_baseline_check, с кэшем).
+# 0 — красных нет (или проверить нельзя), 1 — есть: в $3 обратная связь для
+# планировщика, в $3.red — красные команды по одной в строке.
+# $1 проект $2 JSON разбора $3 файл обратной связи $4 папка задач
+crun_plan_baseline() {
+  local proj="$1" res="$2" fb="$3" tasks="$4"
+  local n=0 total t v spec rel dirty commit red=0 cmd idxs btail
+  : > "$fb"; : > "$fb.red"; : > "$fb.map"
+  [ "$(crun_baseline_enabled "$proj")" = "true" ] || return 0
+  git -C "$proj" rev-parse -q --verify HEAD >/dev/null 2>&1 || return 0
+
+  # Правки вне папки задач — значит, к запуску дерево ещё изменится: гонять сборку
+  # по состоянию, которого не будет, незачем. Проверит предзапуск.
+  case "$tasks" in "$proj"/*) rel="${tasks#$proj/}" ;; *) rel="" ;; esac
+  dirty=$(crun_dirty "$proj" | sed 's/^...//' | { [ -n "$rel" ] && grep -v "^$rel/" || cat; })
+  if [ -n "$dirty" ]; then
+    info "  verify проверю перед запуском: в дереве есть незакоммиченные правки"
+    return 0
+  fi
+
+  commit=$(git -C "$proj" rev-parse --short HEAD 2>/dev/null)
+  total=$(printf '%s' "$res" | jq '.tasks | length' 2>/dev/null || echo 0)
+  [ "${total:-0}" -gt 0 ] 2>/dev/null || return 0
+  printf '\n%sпроверяю предложенные verify на текущем коде (%s)…%s\n' "$C_DIM" "$commit" "$C_RESET"
+  spec=$(mktemp -t crun-plan-spec)
+  while [ "$n" -lt "$total" ]; do
+    t=$(printf '%s' "$res" | jq -c ".tasks[$n]")
+    n=$((n+1))
+    printf '%s' "$t" | jq '{verify, verify_timeout}' > "$spec"
+    v=$(jq -r '.verify // empty' "$spec")
+    [ -n "$v" ] || continue
+    if crun_baseline_check "$proj" "$proj" "$spec" "crun plan" run; then
+      printf '  %s%s%s\n' "$C_DIM" "задача $n: $(crun_baseline_line)" "$C_RESET"
+      continue
+    fi
+    red=1
+    printf '  задача %s: %s\n' "$n" "$(crun_baseline_line)"
+    if ! grep -qxF -- "$v" "$fb.red" 2>/dev/null; then
+      printf '%s\n' "$v" >> "$fb.red"
+      {
+        printf '### `%s`\n\n' "$v"
+        [ -n "$CRUN_BL_PROBE" ] && printf 'Прогнана часть `%s` (остального на текущем коде ещё нет).\n' "$CRUN_BL_PROBE"
+        btail=$(printf '%s\n' "$CRUN_BL_TAIL" | grep -v '^[[:space:]]*$' | tail -n 40)
+        printf '%s' "$([ "$CRUN_BL_STATE" = "timeout" ] && echo "Не уложилась в срок" || echo "Код $CRUN_BL_RC")"
+        if [ -n "$btail" ]; then printf ', хвост вывода:\n\n```\n%s\n```\n\n' "$btail"
+        else printf ', вывода нет.\n\n'; fi
+      } >> "$fb.map"
+    fi
+    printf '%s\t%s\n' "$v" "$n" >> "$fb"
+  done
+  rm -f "$spec"
+  [ "$red" = "1" ] || { : > "$fb"; return 0; }
+
+  # Сборка текста: какие задачи с какой командой, потом хвосты по командам.
+  {
+    printf '## Проверка раннера: предложенные verify красные ещё до работы\n\n'
+    printf 'Раннер выполнил verify твоих задач на текущем коде проекта (коммит %s), до\n' "$commit"
+    printf 'любой работы. Эти команды уже падают — задача с такой проверкой будет\n'
+    printf 'провалена при любом качестве работы, а исполнитель не вправе менять verify.\n\n'
+    while IFS= read -r cmd; do
+      [ -n "$cmd" ] || continue
+      idxs=$(awk -F'\t' -v c="$cmd" '$1 == c { printf "%s%s", (n++ ? ", " : ""), $2 }' "$fb")
+      printf -- '- задачи %s: `%s`\n' "$idxs" "$cmd"
+    done < "$fb.red"
+    printf '\n'
+    cat "$fb.map"
+    printf 'Замени verify у этих задач на команду, которая зелёная на текущем коде: обязательные\n'
+    printf 'проверки проекта (CI, раздел проверок в CLAUDE.md или AGENTS.md). Не добавляй проверок,\n'
+    printf 'которые проект не держит зелёными, не поручай исполнителю чинить чужие ошибки и не\n'
+    printf 'сужай проверку до путей, которых ещё нет. Если зелёной проверки у проекта нет —\n'
+    printf 'verify: null. Остальной разбор не меняй. Верни ready: true и полный список задач.\n'
+  } > "$fb.txt"
+  mv "$fb.txt" "$fb"
+  return 1
 }
 
 # Что дальше после разбора — тот же нумерованный выбор, что у проекта и папки задач.
