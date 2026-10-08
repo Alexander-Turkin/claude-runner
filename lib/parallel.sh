@@ -43,6 +43,11 @@ crun_wt_link() {
     # Только внутри проекта: симлинк наружу увёл бы задачу за границы доступа.
     case "$d" in /*|*..*) continue ;; esac
     [ -e "$proj/$d" ] || continue
+    # Отслеживаемый путь уже лежит в worktree после checkout. Симлинк на его месте
+    # git видит как typechange: `git add -A` в crun_wt_merge коммитит его, и мерж
+    # подменяет файл в основном дереве ссылкой на самого себя — ELOOP. info/exclude
+    # (crun_wt_exclude) это не ловит: отслеживаемые пути он не прячет.
+    [ -n "$(git -C "$work" ls-files -- "$d" 2>/dev/null | head -1)" ] && continue
     # Реальный каталог в воркере (модель сама поставила зависимости) — её, и он
     # никуда за пределы воркера не ведёт. Не трогаем.
     { [ -d "$work/$d" ] && [ ! -L "$work/$d" ]; } && continue
@@ -139,6 +144,7 @@ crun_wt_merge() {
   # Код возврата `git add` здесь тоже не показатель (см. crun_wt_exclude):
   # смотрим на индекс, а не на него.
   git -C "$work" add -A -- . ':(exclude).claude-runner' 2>/dev/null
+  crun_wt_unstage_proj_links "$proj" "$work"
   git -C "$work" diff --cached --quiet 2>/dev/null && return 0
   git -C "$work" commit -q -m "$subject" -m "$summary" 2>/dev/null || return 1
 
@@ -150,6 +156,26 @@ crun_wt_merge() {
   fi
   crun_unlock "$lk"
   return $rc
+}
+
+# Страховка к crun_wt_link: симлинк, ведущий в основное дерево, в коммит не пускаем.
+# Мерж внёс бы его в основное дерево, где он указывает сам на себя (или в слот,
+# которого после прогона уже нет): ELOOP или битая ссылка у всех, кто стянет ветку.
+# Ловит и ссылки, которые создала сама модель. Для typechange `reset` возвращает
+# в индекс версию из HEAD, новый симлинк просто снимает с индекса.
+crun_wt_unstage_proj_links() {
+  local proj="$1" work="$2" meta path mode tgt
+  while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
+    mode=$(printf '%s' "$meta" | cut -d' ' -f2)
+    [ "$mode" = "120000" ] || continue
+    tgt=$(readlink "$work/$path" 2>/dev/null) || continue
+    case "$tgt" in
+      "$proj"|"$proj"/*)
+        git -C "$work" reset -q -- "$path" 2>/dev/null
+        warn "не коммичу симлинк $path -> $tgt: ссылка в основное дерево" ;;
+    esac
+  done < <(git -C "$work" diff --cached --raw -z --no-renames 2>/dev/null)
+  return 0
 }
 
 # Убрать слоты после прогона. Прерванный прогон слоты оставляет — следующий
