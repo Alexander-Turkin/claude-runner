@@ -341,6 +341,8 @@ crun_eval_limited() {
   # stdin из /dev/null: иначе команда вычитает поток очереди задач (см. crun_run_limited).
   ( cd "$dir" && export PATH="$prefix$PATH" && eval "$cmd" ) > "$out" 2>&1 < /dev/null &
   pid=$!
+  # Группа процессов команды — для снятия по Ctrl+C (crun_baseline_abort).
+  CRUN_EVAL_PID=$pid
   [ -n "$mwas" ] || set +m 2>/dev/null || true
 
   while kill -0 "$pid" 2>/dev/null; do
@@ -354,12 +356,14 @@ crun_eval_limited() {
       kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null
       wait "$pid" 2>/dev/null
       exec 2>&3 3>&-
+      CRUN_EVAL_PID=""
       return 124
     fi
     sleep 1; waited=$((waited+1))
   done
 
   wait "$pid"; rc=$?
+  CRUN_EVAL_PID=""
   return $rc
 }
 

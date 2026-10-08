@@ -90,9 +90,52 @@ crun_fm_list() {
     | jq -R -s -c 'split("\n") | map(select(length > 0))'
 }
 
+# Раздел markdown после frontmatter: строки между "## <заголовок>" и следующим "## ".
+# $1 файл $2 заголовок без решёток.
+crun_md_section() {
+  awk -v h="## $2" '
+    NR == 1 && $0 == "---" { fm = 1; next }
+    fm { if ($0 == "---") fm = 0; next }
+    $0 == h { on = 1; next }
+    on && /^## / { exit }
+    on { print }' "$1"
+}
+
+# Пункты списка раздела → по одному в строке. Продолжения пункта (строки без
+# маркера) приклеиваются к нему, чекбокс "[ ]" срезается.
+crun_md_items() {
+  awk '
+    /^[[:space:]]*[-*][[:space:]]+/ {
+      if (cur != "") print cur
+      cur = $0
+      sub(/^[[:space:]]*[-*][[:space:]]+(\[[ xX]\][[:space:]]+)?/, "", cur)
+      next }
+    /^[[:space:]]*$/ { if (cur != "") print cur; cur = ""; next }
+    cur != "" { t = $0; sub(/^[[:space:]]+/, "", t); cur = cur " " t }
+    END { if (cur != "") print cur }'
+}
+
+# Пары "**В:** …" / "**О:** …" раздела «Решения владельца» → "вопрос\tответ".
+# sub(), а не substr(): кириллица многобайтная, а awk режет по байтам.
+crun_md_answers() {
+  awk '
+    /<!--/ { com = 1 }
+    com { if (/-->/) com = 0; next }
+    /^\*\*В:\*\*/ { if (q != "") print q "\t" a; q = $0; a = ""; m = "q"
+                       sub(/^\*\*В:\*\*[[:space:]]*/, "", q); next }
+    /^\*\*О:\*\*/ { a = $0; m = "a"; sub(/^\*\*О:\*\*[[:space:]]*/, "", a); next }
+    /^[[:space:]]*$/ { next }
+    m == "q" { q = q " " $0; next }
+    m == "a" { a = a " " $0; next }
+    END { if (q != "") print q "\t" a }' | sed 's/[[:space:]]*\t/\t/; s/[[:space:]]*$//'
+}
+
 # Быстрый путь: собрать спек из frontmatter без вызова модели.
+# Карточки от crun plan несут во frontmatter id, risk, depends_on и touches, а в теле —
+# «Цель», «Критерии приёмки» и «Решения владельца»: их и разбираем, иначе ручная
+# правка карточки (тот же verify) молча теряла бы критерии, ответы и зависимости.
 crun_compile_frontmatter() {
-  local src order="$2" title verify vtmo deps touches ticket
+  local src order="$2" title verify vtmo deps touches ticket risk bl goal acc ans
   src=$(crun_task_main "$1")
   title=$(crun_fm_get "$src" title)
   ticket=$(crun_fm_get "$src" ticket)
@@ -101,19 +144,41 @@ crun_compile_frontmatter() {
   # длительность удержания — для проверки живучестью.
   vtmo=$(crun_fm_get "$src" verify_timeout)
   case "$vtmo" in ''|*[!0-9]*) vtmo="" ;; esac
+  risk=$(crun_fm_get "$src" risk)
+  case "$risk" in low|medium|high) ;; *) risk=low ;; esac
+  # baseline: false — verify опирается на то, что создаст сама задача.
+  bl=$(crun_fm_get "$src" baseline)
   # Зависимости и область правки: без них задача с frontmatter не смогла бы
   # участвовать в параллельном прогоне осмысленно.
   deps=$(crun_fm_list "$src" depends_on)
   touches=$(crun_fm_list "$src" touches)
-  jq -n --arg t "$title" \
-        --arg g "$(sed -n '/^---$/,/^---$/!p' "$src" | head -40 | tr '\n' ' ' | cut -c1-500)" \
+  # Карточки старых версий crun plan держали их в теле.
+  [ "$deps" = "[]" ] && deps=$(sed -n 's/^\*\*Зависит от:\*\*[[:space:]]*//p' "$src" | head -1 \
+                                | tr ',' ' ' | tr -s ' ' '\n' | jq -R -s -c 'split("\n") | map(select(length > 0))')
+  [ "$touches" = "[]" ] && touches=$(sed -n 's/^\*\*Правит:\*\*[[:space:]]*//p' "$src" | head -1 \
+                                | tr ',' ' ' | tr -s ' ' '\n' | jq -R -s -c 'split("\n") | map(select(length > 0))')
+
+  goal=$(crun_md_section "$src" "Цель")
+  [ -n "$(printf '%s' "$goal" | tr -d '[:space:]')" ] || \
+    goal=$(sed -n '/^---$/,/^---$/!p' "$src" | head -40 | tr '\n' ' ' | cut -c1-500)
+  acc=$(crun_md_section "$src" "Критерии приёмки" | crun_md_items \
+        | jq -R -s -c 'split("\n") | map(select(length > 0))')
+  ans=$(crun_md_section "$src" "Решения владельца" | crun_md_answers \
+        | jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t")
+                       | {q: .[0], a: (.[1] // "")})')
+
+  jq -n --arg t "$title" --arg g "$goal" \
         --arg v "$verify" --arg vt "$vtmo" --arg tk "$ticket" --argjson o "$order" \
-        --argjson d "$deps" --argjson tc "$touches" \
-    '{title:$t, order:$o, goal:$g, acceptance:[], risk:"low",
+        --argjson d "$deps" --argjson tc "$touches" --arg rk "$risk" --arg bl "$bl" \
+        --argjson acc "${acc:-[]}" --argjson ans "${ans:-[]}" \
+    '{title:$t, order:$o, goal:($g | sub("^\\s+"; "") | sub("\\s+$"; "")),
+      acceptance:$acc, risk:$rk,
       verify:(if $v == "" then null else $v end),
       verify_timeout:(if $vt == "" then null else ($vt | tonumber) end),
       ticket:(if $tk == "" then null else $tk end),
-      depends_on:$d, touches:$tc, open_questions:[]}'
+      depends_on:$d, touches:$tc, open_questions:[]}
+     + (if ($ans | length) > 0 then {answers:$ans} else {} end)
+     + (if $bl == "false" then {baseline:false} else {} end)'
 }
 
 # Компиляция одной задачи через модель. stdout = JSON спека.
@@ -244,7 +309,7 @@ crun_compile_dir() {
   local proj="$1" tasks="$2" bin="$3" model="$4" force="$5" only="${6:-}" limit="${7:-0}"
   local list="${8:-/dev/null}" jobs="${9:-1}"
   : > "$list"
-  local state cdir src sha order spec out id code n=0 built=0
+  local state cdir src sha order spec out id code fid n=0 built=0
   local entries plan rdir
   state=$(crun_state_dir "$proj"); cdir="$state/compiled"
   mkdir -p "$cdir"
@@ -285,6 +350,9 @@ crun_compile_dir() {
     built=$((built+1))
     if crun_has_frontmatter "$(crun_task_main "$src")"; then
       printf '  %-34s %sиз frontmatter%s\n' "$(basename "$src")" "$C_DIM" "$C_RESET"
+      # id из frontmatter важнее имени файла: на него ссылаются depends_on соседей.
+      fid=$(crun_fm_get "$(crun_task_main "$src")" id)
+      case "$fid" in ''|*[!A-Za-z0-9._-]*) ;; *) code="$fid" ;; esac
       spec=$(crun_compile_frontmatter "$src" "$order")
       crun_compile_write "$proj" "$src" "$sha" "$order" "$code" "$spec" >/dev/null
     else

@@ -8,10 +8,9 @@ crun_build_prompt() {
   acc=$(jq -r '.acceptance[]? | "- " + .' "$spec")
   [ -z "$acc" ] && acc="- (в постановке не заданы — держись цели)"
 
-  verify=$(jq -r '.verify // empty' "$spec")
-  if [ -n "$verify" ]; then
-    verify=$(printf '**Проверка:** после работы раннер выполнит `%s`. Убедись, что проходит.\n' "$verify")
-  fi
+  # Текст зависит от того, что показала база (crun_baseline_check в crun_run_one):
+  # при зелёной базе исполнитель знает, что красное после работы — его.
+  verify=$(crun_baseline_prompt "$(jq -r '.verify // empty' "$spec")")
 
   # Ответы владельца идут ПЕРЕД неясными местами и весомее их: это единственное,
   # что человек успел сказать до автономного прогона.
@@ -81,7 +80,7 @@ crun_install_hint() {
 # текст, и `&`, `\` в нём ничего значить не должны. В шаблон идут только числа.
 # $1 команда verify $2 номер попытки $3 сколько всего. Читает CRUN_VFAIL_SHORT и CRUN_VOUT.
 crun_build_fix_prompt() {
-  local verify="$1" n="$2" max="$3" vtail tpl
+  local verify="$1" n="$2" max="$3" vtail tpl bline
   # В параллельном прогоне лог задачи лежит вне worktree, и модель его не прочитает:
   # вывод идёт прямо в промпт. Хвост — там у тестов и линтеров итог.
   vtail=$(printf '%s\n' "$CRUN_VOUT" | tail -n 200 | tail -c 30000)
@@ -89,8 +88,11 @@ crun_build_fix_prompt() {
   tpl=$(cat "$CRUN_HOME/prompts/fix.md")
   tpl="${tpl//\{\{ATTEMPT\}\}/$n}"
   tpl="${tpl//\{\{MAX\}\}/$max}"
-  printf '## Проверка раннера не прошла\n\nТы отчитался, что задача сделана, но раннер выполнил свою проверку, и она не прошла.\n\n**Команда:**\n\n```\n%s\n```\n\n**Итог:** %s\n\n**Вывод команды** (последние строки):\n\n```\n%s\n```\n\n%s\n' \
-    "$verify" "$CRUN_VFAIL_SHORT" "$vtail" "$tpl"
+  # $(…) срезает хвостовые переводы строк — возвращаем отступ до следующего блока.
+  bline=$(crun_baseline_fix_line)
+  [ -n "$bline" ] && bline="$bline"$'\n\n'
+  printf '## Проверка раннера не прошла\n\nТы отчитался, что задача сделана, но раннер выполнил свою проверку, и она не прошла.\n\n**Команда:**\n\n```\n%s\n```\n\n**Итог:** %s\n\n%s**Вывод команды** (последние строки):\n\n```\n%s\n```\n\n%s\n' \
+    "$verify" "$CRUN_VFAIL_SHORT" "$bline" "$vtail" "$tpl"
 }
 
 # Один вызов claude по задаче: первая попытка или, с $4, дозапуск той же сессии.
@@ -178,7 +180,7 @@ crun_task_report() {
 # Переменные crun_run_one видны здесь по динамической области видимости.
 crun_task_verify() {
   local vblock vlive vmiss hint vtmo vfile vt0 vsecs vrc vout
-  CRUN_VFAIL=""; CRUN_VFAIL_SHORT=""; CRUN_VOUT=""
+  CRUN_VFAIL=""; CRUN_VFAIL_SHORT=""; CRUN_VOUT=""; CRUN_VLAST_OK=0; CRUN_VSECS=0
   info "  проверка: $verify"
 
   # Команда, которая не завершается сама (`docker compose up`, dev-сервер), — это
@@ -200,7 +202,7 @@ crun_task_verify() {
         command: $cmd,
         how:   ("Если инструмент ставится иначе — поставьте его в окружение проекта " +
                 "(.venv, node_modules) или укажите каталог с ним в ключе toolPaths " +
-                "файла .claude-runner.json.")}]')" >/dev/null
+                "файла .claude-runner.json.")}]')" "$sha" "$(jq -r ._source "$spec")" >/dev/null
     printf '\n--- verify: %s (не запущена) ---\nнет команд в PATH: %s\n' \
       "$verify" "$vmiss" >> "$logs/$id.log"
     warn "проверка не запущена — нет команд: $vmiss"
@@ -216,7 +218,7 @@ crun_task_verify() {
   crun_eval_limited "$vtmo" "$work" "$binpath" "$verify" "$vfile"; vrc=$?
   vsecs=$(( $(date +%s) - vt0 ))
   vout=$(cat "$vfile"); rm -f "$vfile"
-  CRUN_VOUT="$vout"
+  CRUN_VOUT="$vout"; CRUN_VSECS="$vsecs"
 
   # Уборка обязательна и при успехе, и при провале: контейнеры живут в демоне
   # docker и снятие нашей группы процессов их не гасит.
@@ -249,9 +251,12 @@ crun_task_verify() {
   printf '\n--- verify: %s (exit %s) ---\n%s\n' "$verify" "$vrc" "$vout" >> "$logs/$id.log"
   if [ "$vrc" != "0" ]; then
     CRUN_VFAIL="модель отчиталась completed, но проверка \`$verify\` упала (код $vrc)"
+    [ "$CRUN_BL_STATE" = "green" ] && \
+      CRUN_VFAIL="$CRUN_VFAIL; на базе $CRUN_BL_COMMIT та же команда была зелёной — падение внесено задачей"
     CRUN_VFAIL_SHORT="проверка не прошла (код $vrc)"
     return 1
   fi
+  CRUN_VLAST_OK=1
   return 0
 }
 
@@ -281,15 +286,12 @@ crun_run_one() {
 
   CRUN_LAST_COST=0; CRUN_LAST_TURNS=0; CRUN_LAST_SECS=0
   CRUN_LAST_FIXES=0; CRUN_LAST_SID=""
-  prompt=$(crun_build_prompt "$proj" "$spec")
+  CRUN_VLAST_OK=0; CRUN_VSECS=0; CRUN_VOUT=""
   verify=$(jq -r '.verify // empty' "$spec")
   fixmax=$(crun_fix_attempts "$proj")
   export CRUN_GUARD_LOG="$logs/guard.log"
-
-  # Снимок до запуска: иначе при --allow-dirty в «изменено» попадут чужие файлы,
-  # которых задача не касалась.
-  local before_dirty
-  before_dirty=$(crun_dirty "$work" | sort)
+  # Прежние просьбы этой задачи либо выполнены, либо всплывут снова.
+  crun_needs_clear "$proj" "$id" "$sha" "$(jq -r ._source "$spec")"
 
   t0=$(date +%s)
   binpath=$(crun_project_bin_path "$work")
@@ -316,6 +318,30 @@ crun_run_one() {
     # node_modules основного дерева — сразу у всех слотов.
     export pnpm_config_verify_deps_before_run=false
   fi
+
+  # Проверка на базе: verify, красная ещё до работы, провалит задачу при любом
+  # качестве работы. Узнаём это здесь, в рабочем каталоге задачи (у зависимой
+  # задачи база уже включает влитые зависимости), и не тратим на неё модель.
+  if ! crun_baseline_check "$proj" "$work" "$spec" "слот $slot" run; then
+    crun_state_set "$proj" "$sha" "$id" blocked "$(jq -r ._source "$spec")"
+    crun_needs_write "$proj" "$id" \
+      "$(crun_baseline_needs "$id" "$verify" "$(jq -r ._source "$spec")")" "$sha" \
+      "$(jq -r ._source "$spec")" >/dev/null
+    printf '\n--- база %s: verify красная до работы (%s) ---\n%s\n' "$CRUN_BL_COMMIT" \
+      "$([ "$CRUN_BL_STATE" = "timeout" ] && echo таймаут || echo "код $CRUN_BL_RC")" \
+      "$CRUN_BL_TAIL" > "$logs/$id.log"
+    warn "проверка красная ещё до работы (база $CRUN_BL_COMMIT) — claude не запускался"
+    crun_baseline_tail_lines 3
+    return 2
+  fi
+  case "$CRUN_BL_STATE" in green|na) info "  $(crun_baseline_line)" ;; esac
+
+  # Промпт — после базы: текст блока «Проверка» зависит от её итога.
+  prompt=$(crun_build_prompt "$proj" "$spec")
+  # Снимок до запуска (и после прогона базы — её артефакты не правки задачи):
+  # иначе при --allow-dirty в «изменено» попадут чужие файлы.
+  local before_dirty
+  before_dirty=$(crun_dirty "$work" | sort)
 
   crun_mcp_args "$proj"
   # В параллельном прогоне cwd — worktree, а папка задачи лежит в основном дереве,
@@ -356,7 +382,7 @@ crun_run_one() {
       needs=$(printf '%s' "$result" | jq -c '.needs_from_user // []')
       crun_state_set "$proj" "$sha" "$id" blocked "$(jq -r ._source "$spec")"
       if [ "$(printf '%s' "$needs" | jq 'length')" != "0" ]; then
-        crun_needs_write "$proj" "$id" "$needs" >/dev/null
+        crun_needs_write "$proj" "$id" "$needs" "$sha" "$(jq -r ._source "$spec")" >/dev/null
         warn "нужно ваше участие: $summary"
         return 2
       fi
@@ -459,6 +485,9 @@ crun_run_one() {
     fi
   fi
 
+  # Зелёный verify после коммита — это база следующей задачи: кладём в кэш.
+  [ "$CRUN_VLAST_OK" = "1" ] && \
+    crun_baseline_seed "$proj" "$work" "$spec" "$id" "$CRUN_VSECS" "$CRUN_VOUT"
   crun_state_set "$proj" "$sha" "$id" done "$(jq -r ._source "$spec")"
   crun_progress_add "$proj" "$id" "$(jq -r .title "$spec")" "$summary"
   return 0
